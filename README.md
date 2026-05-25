@@ -53,16 +53,20 @@ For catalog documentation, see the appendix of [Robertson et al. (2026)](https:/
 
 ## 3. JWST Grism Data Reduction
 
-We will run our own grism calibration and mosaic, which is modified from [Fengwu Sun's JWST NIRCam WFSS data reduction pipeline](https://github.com/fengwusun/nircam_grism). The modified version is [xxx](xxx). Major changes are:
+We will run our own grism calibration and mosaic, which is modified from [Fengwu Sun's JWST NIRCam WFSS data reduction pipeline](https://github.com/fengwusun/nircam_grism). The modified version is [nircam_wfss](./nircam_wfss/src/run_pipeline.py). Major changes are:
 - Skip sensitivity calibration during data reduction and keep the `DN/s` unit, because we forward model the sensitivity.
 - We coadd the grism image grouped by roll angles / dispersion directions. 
-- blabla
+- Emission line cutouts are produced around the emisison line mentioned in the source catalog. 
+- Extra header information that are needed by kltools for kinematic lensing fitting.
 
-To reduce the grism data, we first get a catalog of line emitting galaxies, do a preliminary target selection to select galaxies that are useful for KL measurement. Then, we will calculate the grism dispersion trace of each object, and extract their 2D grism spectra. 2D spectra are coadded grouped by dispersion angle, and a continuum is subtracted by mediam filter. We will build 2D cutouts including their brandband image and emission line-only 2D grism. 
+To reduce the grism data, we first get a catalog of line emitting galaxies, clean up the catalog, do a preliminary target selection to select galaxies that are useful for KL measurement. Then, we will calculate the grism dispersion trace of each object, and extract their 2D grism spectra. 2D spectra are coadded grouped by dispersion angle, and a continuum is subtracted by mediam filter. We will build 2D cutouts including their brandband image and emission line-only 2D grism. 
 
 ### 3.1 Catalog Adjustment
 
-The low-z Paschen and Brackett emitters in the original Fengwu's catalog may have artifacts in centroid determination and may contain duplicated objects. Therefore, we need to match Fengwu's catalog to JADES public catalog (DR5) and adjust the RA/DEC and OBJID.
+> notebook: [Catalog_Adjustment.ipynb](./notebook/Catalog_Adjustment.ipynb)
+
+(This is an optional step)
+The low-z Paschen and Brackett emitters in the original Fengwu's catalog were matched to prelimiary JADES photometry catalog, and may have artifacts in centroid determination and may contain duplicated objects. Therefore, we need to match Fengwu's catalog to JADES public catalog (DR5) and adjust the RA/DEC and OBJID.
 
 The original Fengwu's catalogues are 
 - `v094_gds_fresco_line_list_low-ground-z_Pa_Br.fits`, 
@@ -77,20 +81,24 @@ After removing duplicated objects and unmatched objects, the number of galaxies 
 The adjusted catalogs are saved to `/xdisk/timeifler/jiachuanxu/jwst/fengwu_catalog`:  
 - `v1_gds_fresco_line_list_low-ground-z_Pa_Br_jades_dr5.fits`
 - `v1_gdn_fresco_line_list_low-ground-z_Pa_Br_jades_dr5.fits`
-- `v1_gdn_congress_line_list_low-ground-z_Pa_Br_jades_dr5.fits`. 
+- `v1_gdn_congress_line_list_low-ground-z_Pa_Br_jades_dr5.fits`.
+
+> Note: The catalog adjustment notebook above also contains merging system removal step. Although the merging detection step is technically in [Sect. 3.2](#32-imaging-target-selection), those two steps may be merged into one step in future. The workflow, including how to detect merging system, is still not finalized. 
 
 
 ### 3.2 Imaging Target Selection
+
+> notebook: [Preliminary_Target_Selection.ipynb](./notebook/Preliminary_Target_Selection.ipynb)
 
 We don't need to reduce the grism spectra for all galaxies because, e.g., galaxies in merging or blending systems are not useful. We do the first round of **target selection** based on the broadband image of those galaxies to save computational resources --- but feel free to extract the 2D spectrum of discarded objects for your interest. 
 
 KL sample first needs to pass standard weak lensing source sample selectrion criteria:
 
-- No blending/merging galaxies: for now, we require that the Kron ellipse of the 5th nearest objects do not intersect the Kron ellipse of the primary target. Otherwise, if there's overlap, we require that the total flux from contaminant objects is no more than 10 percent of the primary object flux.  
+- No blending/merging galaxies: For now, we examine for possible merging/blending by eye. We first identified k-nearest objects around the target galaxy, and plot their Kron ellipse in a JWST F115W/F200W/F444W pseduo-RGB cutout. We require that the Kron ellipse of the 5th nearest objects do not intersect the Kron ellipse of the primary target. Otherwise, if there's overlap, we require that the total flux from contaminant objects is no more than 10 percent of the primary object flux. However, given that the JADES catalog source extractor Kron radius and detection segmentation is not perfect (e.g. some sub-structures of a large galaxy could be identified as separate objects, two blended galaxies may be identified as a single object, etc), this criteria is used as a guidance, and a visual examination is used to make the final selection. 
 - No bleeding (visual examination)
-- Star-galaxy separation shows it's an extended galaxy, not point source like star or AGN
+- Star-galaxy separation shows it's an extended galaxy, not point source like star or AGN (now implemented as visual examination since there's not so many galaxies, but will need a rigorous star-galaxy separation in future when applied to larger datasets.)
 - Not on the edge of detector (visual examination)
-- spatial resolution factor R > 0.4 (star-galaxy separation and spatial resolution factor is roughly the same thing...)
+- spatial resolution factor R > 0.4
 
 We down-select the v1 catalog produced in [Sect. 3.1](#31-catalog-adjustment) based on these criteria (see notebook [`Preliminary_Target_Selection.ipynb`](./notebook/Preliminary_Target_Selection.ipynb)), and save the catalog to `v2` version. 
 
@@ -109,12 +117,31 @@ So all galaxies pass the WL size criteria, and roughly 80 percent of galaxies su
 
 ### 3.3 Grism Reduction
 
-For the objects in v2 catalog, we extract their 2D grism spectrum by running the customized NIRCam/WFSS pipeline [xxx?](xxx?)
+> pipeline: [nircam_wfss/src/run_pipeline.py](./nircam_wfss/src/run_pipeline.py)
 
+For the objects in v2 catalog, we extract their 2D grism spectrum by running the customized NIRCam/WFSS pipeline [nircam_wfss](./nircam_wfss). The data reduction options are stored and described in YAML configuration files (e.g. see [this YAML](./nircam_wfss/configs/PID1895_FRESCO_GDS_F444W.yaml) for an example of FRESCO GOODS-S field). The pipeline usage is 
 
-## 4. Target Selection
+> python run_pipeline.py <path/to/config.yaml>
 
+This will produce the following data products in the `extract_dir` directory:
 
+- `allspec_2d_${BAND}_ID${OBJID}.fits`: all the 2D extracted un-coadded spectra per frame, compiled in one file.
+- `spec_2d_${BAND}_ID${OBJID}_${MODE}${PUPIL}coadd.fits`: stacked 2D spectra, grouped by mode (A or B) and grism pupil (R or C). 
+- `spec_2d_${BAND}_ID${OBJID}_allcoadd.fits`: stacked 2D spectra for all modes and pupils. This is only used for 1d spectra extraction, not for 2D modeling. 
+- `spec_1d_${BAND}_ID${OBJID}_allcoadd.fits`: stacked 1D spectra
+-  `emline_2d_${BAND}_ID${OBJID}_${EMLISSION_LINE}_${MODE}${PUPIL}coadd_${COADD_METHOD}.fits`: stacked 2D cutout of emission line `EMLISSION_LINE`, grouped by mode and pupil. There are two coadd methods, drizzle (`COADD_METHOD=drz`) or nearest pixel (`COADD_METHOD=simple`). The drizzle method has strong correlated noise, and currently we suggest using the simple method. In future, we may consider include `IMCOM` to do the mosaic. 
+
+## 4. Measure Kinematic Lensing with `kltools` Pipeline
+
+### 4.1 Removing sub-structures in imaging
+
+Since JWST is so powerful that it can resolve the sub-structures of galaxies (spiral arms, star formation knots, etc.) with unprecedented resolution, and our KL pipeline assumes a parametric smooth morphology profile, we need to remove the sub-structures in the galaxy image which may potentially bias our KL measurement. To do so, we first run a 2D bulge+disk decomposition on the broadband image of the source galaxies, without turning on cosmic shear. The overall goal is to fit the large-scale smooth profile with a flexible bulge+disk model, and subtract the residual sub-structures. 
+
+### 4.2 Run kinematic lensing pipeline
+
+## 5. Target Selection
+
+The steps above are trying to include as much galaxies as possible since the target selection rules are not defined for grism-based kinematic lensing yet. This section should study the target selection rules based on kinematic lensing fit on prelimiary targets. 
 
 ## Food for thought
 
