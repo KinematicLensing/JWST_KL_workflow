@@ -20,7 +20,7 @@ Pipeline stages
 8.  Stage-5    – load source catalogue, build per-frame POM-applied catalogs.
 9.  Stage-6    – extract 2-D grism spectra for every source.
 10. Stage-7    – extract 1-D spectra + diagnostic plots.
-11. Stage-8    – extract 2-D emission-line cutouts (requires z_spec).
+11. Stage-8    – extract 2-D emission-line cutouts (requires z_grism).
 
 Usage
 -----
@@ -59,7 +59,8 @@ from nircam_wfss.dispersion import GrismConf
 from nircam_wfss.extraction import (
     extract_2d_spec_worker,
     extract_1d_spec_worker,
-    extract_2d_emline_worker,
+    extract_2d_emline_worker_drizzle,
+    extract_2d_emline_worker_simple,
 )
 from nircam_wfss.pom import build_POM_applied_catalog
 
@@ -117,9 +118,13 @@ def _extract_1d_spec_worker(args):
     """Unpack (spec2d_path, extraction_dir, do_boxcar, grism_conf, mosaic params) and call extract_1d_spec_worker."""
     return extract_1d_spec_worker(*args)
 
-def _extract_2d_emline_worker(args):
-    """Unpack args and call extract_2d_emline_worker."""
-    return extract_2d_emline_worker(*args)
+def _extract_2d_emline_worker_drizzle(args):
+    """Unpack args and call extract_2d_emline_worker_drizzle."""
+    return extract_2d_emline_worker_drizzle(*args)
+
+def _extract_2d_emline_worker_simple(args):
+    """Unpack args and call extract_2d_emline_worker_simple."""
+    return extract_2d_emline_worker_simple(*args)
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +132,24 @@ def _extract_2d_emline_worker(args):
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the full NIRCam WFSS grism extraction pipeline."""
+    """
+    Run the full NIRCam WFSS grism extraction pipeline.
+
+    Parses one positional argument: the path to a YAML configuration file.
+    Pipeline stages 2a–8 are executed in sequence using the settings from
+    that file (see the module-level docstring for a stage overview).
+
+    Parameters
+    ----------
+    argv:
+        Argument list forwarded to ``argparse``.  ``None`` falls back to
+        ``sys.argv[1:]``.
+
+    Returns
+    -------
+    exit_code:
+        0 on success, 1 if the configuration file is not found.
+    """
 
     # =========================================================================
     # Parse command-line arguments
@@ -228,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
         print("No SW rate files found – skipping Stage-3.")
 
     # =========================================================================
-    # STAGE 4 – Astrometry Calibration (out of context window?)
+    # STAGE 4 – Astrometry Calibration
     # =========================================================================
     print("\n========== STAGE 4: Astrometry Calibration ==========")
     if os.path.isfile(cfg.astrometry_cal_table):
@@ -294,7 +316,10 @@ def main(argv: list[str] | None = None) -> int:
             grism_conf,
             cfg.aperture_pix,
             cfg.grism_filter,
-            cfg.extract_dir
+            cfg.extract_dir,
+            cfg.bunit_spec2d,
+            True,
+            cfg.overwrite_spec2d,
         ))
     with Pool(min(cfg.n_procs, len(tb_source))) as pool:
         pool.map(_extract_2d_spec_worker, spec2d_args)
@@ -328,31 +353,54 @@ def main(argv: list[str] | None = None) -> int:
     # =========================================================================
     # STAGE 8 – Extract 2D emission-line cutouts for each source
     # =========================================================================
-    # Requires 'z_spec' and 'name_line_exp' columns in the source catalogue.
+    # Requires 'z_grism' and 'name_line_exp' columns in the source catalogue.
     print("\n========== STAGE 8: Extract 2D Emission-Line Cutouts ==========")
-    if "z_spec" in tb_source.colnames and "name_line_exp" in tb_source.colnames:
-        emline_args = []
-        for i in range(len(tb_source)):
-            objid = str(tb_source["ID"][i])
-            POM_of_this_source = frame_path["path_" + objid]
-            if len(POM_of_this_source) == 0:
-                continue
-            emline_args.append((
-                frame_ID[objid],
-                frame_path["path_" + objid],
-                list_v1p5_this_band,
-                tb_source[i],
-                grism_conf,
-                cfg.grism_filter,
-                cfg.extract_dir,
-                51,                  # cutout_size (native pixels)
-                cfg.psf_oversample,  # PSF super-sampling factor
-            ))
-        if emline_args:
-            with Pool(min(cfg.n_procs, len(emline_args))) as pool:
-                pool.map(_extract_2d_emline_worker, emline_args)
+    if "z_grism" in tb_source.colnames and "name_line_exp" in tb_source.colnames:
+        if cfg.coadd_method == "drizzle":
+            print("Using drizzle-based extraction for emission-line cutouts.")
+            emline_args = []
+            for i in range(len(tb_source)):
+                objid = str(tb_source["ID"][i])
+                POM_of_this_source = frame_path["path_" + objid]
+                if len(POM_of_this_source) == 0:
+                    continue
+                emline_args.append((
+                    frame_ID[objid],
+                    frame_path["path_" + objid],
+                    list_v1p5_this_band,
+                    tb_source[i],
+                    grism_conf,
+                    cfg.grism_filter,
+                    cfg.extract_dir,
+                    cfg.cutout_size_drizzle,      # cutout_size
+                    cfg.finalscale_drizzle,
+                    cfg.pixfrac_drizzle,
+                    cfg.psf_oversample,  # PSF super-sampling factor
+                ))
+            if emline_args:
+                with Pool(min(cfg.n_procs, len(emline_args))) as pool:
+                    pool.map(_extract_2d_emline_worker_drizzle, emline_args)
+        else:
+            print("Using simple direct cutout extraction for emission-line cutouts.")
+            emline_args = []
+            for i in range(len(tb_source)):
+                objid = str(tb_source["ID"][i])
+                POM_of_this_source = frame_path["path_" + objid]
+                if len(POM_of_this_source) == 0:
+                    continue
+                emline_args.append((
+                    tb_source[i],
+                    grism_conf,
+                    cfg.grism_filter,
+                    cfg.extract_dir,
+                    cfg.cutout_size_simple,
+                    cfg.psf_oversample,
+                ))
+            if emline_args:
+                with Pool(min(cfg.n_procs, len(emline_args))) as pool:
+                    pool.map(_extract_2d_emline_worker_simple, emline_args)
     else:
-        print("  Skipping: source catalogue lacks 'z_spec' or 'name_line_exp' columns.")
+        print("  Skipping: source catalogue lacks 'z_grism' or 'name_line_exp' columns.")
 
     return 0
 # ---------------------------------------------------------------------------
