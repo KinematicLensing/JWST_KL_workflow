@@ -37,8 +37,7 @@ from photutils.background import Background2D, MedianBackground
 import matplotlib.pyplot as plt
 from nircam_wfss.plotting import corner_text
 
-'''Linear Function'''
-linear = lambda x, k, b: x * k + b
+linear = lambda x, k, b: x * k + b  # noqa: E731
 
 
 def reduce_img_stage2(
@@ -251,7 +250,6 @@ def calibrate_astrometry(
         and ``pa_offset``, or ``None`` if the astrometry could not be
         calibrated (e.g. no sources detected).
     """
-    '''SW astrometry table'''
     if os.path.isfile(astrometry_cal_table) and not overwrite:
         print("Astrometry calibration table already exists, skipping: %s" % astrometry_cal_table)
         return ascii.read(astrometry_cal_table)
@@ -274,7 +272,7 @@ def calibrate_astrometry(
     for colname in tb_sw_astrometry.colnames[2:]: tb_sw_astrometry[colname].info.format = '.4f'
     sigma_clip = SigmaClip(sigma = 2.)
 
-    '''Run the following loop to compute astrometric offsets for each group of SW exposures.'''
+    # Compute astrometric offsets for each group of SW exposures.
     print('>>>  Astrometry (RA/DEC) offsets calculation for %3d SW Frames' % len(tmp_rate_sw))
     for k in range(len(tmp_rate_sw) // 4):
         ## For each cal.fits, get all the paths of csal.fits from all four detector.
@@ -296,7 +294,7 @@ def calibrate_astrometry(
             if os.path.isfile(tmp_img_cal_path)==False: 
                 print('%s not found!' % tmp_img_cal_path)
                 continue
-            '''Directly use prepared SW DAOFIND catalog'''
+            # Load pre-computed DAOFIND catalog for this detector.
             tmp_tb_daofind = ascii.read(os.path.join(astrometry_dir, 
                     os.path.basename(tmp_img_cal_path)\
                         .replace('_cal.fits', '_daofind.dat')\
@@ -308,8 +306,8 @@ def calibrate_astrometry(
         tmp_coord_daofind = tb_daofind['skycoord'] 
         
         
-        '''Astrometric Source RA & DECs'''
-        ### rough center of the frame
+        # Cross-match DAOFIND sources to the astrometric reference catalog.
+        # rough center of the frame
         tmp_coord_center = SkyCoord(np.median(tmp_coord_daofind.ra), np.median(tmp_coord_daofind.dec))
         ### only select sources close to the center
         tmp_coord_ref = tmp_coord_ref[tmp_coord_center.separation(tmp_coord_ref) < 8 * u.arcmin]

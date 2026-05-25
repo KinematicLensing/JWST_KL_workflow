@@ -120,11 +120,6 @@ class PipelineConfig:
         NIRCam filter used for the grism observation (e.g. ``'F444W'``).
     n_procs:
         Number of parallel worker processes for pool-based steps.
-    # extract_mode:
-    #     Which grism pupils to include: ``'all'``, ``'R'``, or ``'C'``.
-    # mod_mode:
-    #     Which detector modules to include: ``'comb'`` (A+B), ``'modA'``, or
-    #     ``'modB'``.
     image_mosaic_dir:
         Directory containing large JWST image mosaics on disk (used for
         direct-image cutouts instead of querying MAST).
@@ -149,6 +144,9 @@ class PipelineConfig:
         more conservative (fewer hot pixels flagged).  Tune this parameter based
         on the noise properties of your data and the desired balance between
         hot-pixel rejection and preservation of real sources.
+    bunit_spec2d:
+        Brightness unit for the stacked extracted 2D spectra:
+        ``'DN/s'`` (native detector units) or ``'mJy'`` (flux density).
     """
 
     # Directories
@@ -180,8 +178,15 @@ class PipelineConfig:
     aperture_pix:  float = 15.0
     sigma_hot:     float = 20.0
     overwrite:     bool = False
+    overwrite_spec2d: bool = False
     psf_oversample: int  = 4
-
+    bunit_spec2d: str = "DN/s" # "DN/s" or "mJy"
+    coadd_method: str = "simple"  # "simple" or "drizzle"
+    finalscale_drizzle: float = 0.035  # output pixel scale (arcsec/pix) for drizzle coadd
+    pixfrac_drizzle:    float = 0.8    # pixfrac drop-size passed to Drizzle.add_image
+    cutout_size_drizzle: int = 51      # cutout size in pixels for drizzle coadds
+    cutout_size_simple: int = 51        # cutout size in pixels for simple coadds
+    
     def __post_init__(self) -> None:
         # Set default sub-directory names relative to data_dir when not given
         if not self.calibrated_dir:
@@ -292,7 +297,7 @@ class PipelineConfig:
                   self.extract_dir]:
             os.makedirs(d, exist_ok=True)
 
-    def select_rate_files(self, filter=None) -> None:
+    def select_rate_files(self, filter=None) -> np.ndarray:
         """Select grism rate files matching the target filter and pupil criteria."""
         if filter is None:
             filter = self.grism_filter
@@ -302,7 +307,7 @@ class PipelineConfig:
         print("%d %s grism rate files found." % (len(list_rate_this_band), filter))
         return list_rate_this_band
     
-    def select_lv1p5_files(self, filter=None) -> None:
+    def select_lv1p5_files(self, filter=None) -> np.ndarray:
         """Select calibrated lv1.5 files matching the target filter and pupil criteria."""
         if filter is None:
             filter = self.grism_filter

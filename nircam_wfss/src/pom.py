@@ -91,7 +91,7 @@ def is_pickoff(
     pom_data_dir: str = "./data/GRISM_NIRCAM",
 ) -> np.ndarray:
     """
-    Determine whether source(s) at pixel (x, y) are picked by the pick-off mirror.
+    Determine whether source(s) at pixel (x, y) are obscured by the pick-off mirror.
 
     Parameters
     ----------
@@ -249,14 +249,9 @@ def build_POM_applied_catalog(
     POM_catalogs = []
     POM_catalog_paths = []
     for i, tmp_lv1p5_path in enumerate(all_lv1p5_list):
-        ''' 
-        ## The following commands are used to read the astrometric offsets which is measured with SW detectors.
-        ## In real life, the pointing accuracy of the telescope may not be stable and the absolute RA and DEC 
-        ## offset can be floating. We will need to measure the astrometric shift from the SW exposures associated 
-        ## with the grism exposures, and correct this factor for the RA and DEC in each source catalog associated 
-        ## with the grism exposures. 
-        '''
-
+        # Apply astrometric offsets measured from simultaneous SW direct images.
+        # Pointing accuracy can vary; the SW-derived dRA/dDEC/theta correction
+        # is applied to each grism frame's SCI header before projecting sources.
         tmp_rate_path_base = tmp_lv1p5_path.split('/')[-1].split('long_rate')[0]
         print('[%3d]' % i, tmp_rate_path_base)
 
@@ -267,7 +262,6 @@ def build_POM_applied_catalog(
         
         source_coords = SkyCoord(tb_source["RA"], tb_source["DEC"], unit=(u.deg, u.deg))
 
-        '''Apply astrometric error correction measured on SW images to LW grism header'''
         item_sw_astrom = tb_sw_astrometry[tb_sw_astrometry['expName'] == tmp_rate_path_base]
         if len(item_sw_astrom) > 0:
             ## if there is astrometric information, consider that
@@ -287,7 +281,7 @@ def build_POM_applied_catalog(
             ## if no astrometric information avaialble, skip this step and directly use RA and DEC
             print('Warning: No SW images found for %s, skip astrom correction! ' % tmp_rate_path_base)
         
-        '''Convert RA/DEC of sources to grism-frame x and y'''
+        # Project source RA/DEC into grism-frame pixel coordinates.
         tmp_grism_wcs = wcs.WCS(tmp_grism_hd_sci)
         idx_this_field = np.where(
             (np.abs((tb_source["RA"] - tmp_grism_hd_sci['crval1']) * np.cos(np.deg2rad(tmp_grism_hd_sci['crval2']))) < 4 / 60.) &
@@ -299,7 +293,6 @@ def build_POM_applied_catalog(
 
         tb_sub = tb_source[idx_this_field]
 
-        '''for DAOFIND-based catalog '''
         if 'F444W_mag' in tb_sub.colnames: tmp_mag_auto = tb_sub['F444W_mag'].data
         elif 'F200W_mag' in tb_sub.colnames: tmp_mag_auto = tb_sub['F200W_mag'].data
         tb_pom_applied = Table(data = [tb_sub['ID'].data, tb_sub["RA"], tb_sub["DEC"], 

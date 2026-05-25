@@ -97,8 +97,9 @@ def background_grism_stage2(
 
     Parameters
     ----------
-    arr_grism_rate:
-        3-D stack of grism images, shape (ny, nx, n_frames).
+    fanmes:
+        List of paths to grism *rate.fits* (or lv1.5) files for this
+        filter/module/pupil combination.  Frames are stacked on the fly.
     tmp_module:
         Detector module: ``'A'`` or ``'B'``.
     tmp_pupil:
@@ -478,13 +479,32 @@ def my_grism_bkg_subtraction(
     tmp_grism_fits.close()
 
 
-def robust_median_bkg(img, mask = False):
-    '''get robust background of image by masking brightest 25th percentile of the data in row / column '''
-    arr_x_avg = np.nanpercentile(img, 75, axis = 0)
-    arr_y_avg = np.nanpercentile(img, 75, axis = 1)
+def robust_median_bkg(img, mask=False):
+    """
+    Estimate a robust global background by masking the brightest 25th percentile
+    of rows and columns.
+
+    Parameters
+    ----------
+    img:
+        2-D image array.
+    mask:
+        If ``True``, return ``(background, img_mask)`` where ``img_mask`` is a
+        2-D binary array (0 = masked out, 1 = used for background estimation).
+
+    Returns
+    -------
+    background:
+        Sigma-clipped median background value.
+    img_mask (optional):
+        Binary mask array, returned only when ``mask=True``.
+    """
+    arr_x_avg = np.nanpercentile(img, 75, axis=0)
+    arr_y_avg = np.nanpercentile(img, 75, axis=1)
     img_mask = np.ones_like(img)
-    img_mask[np.where(arr_y_avg < np.nanmedian(arr_y_avg))[0],:]  = 0
-    img_mask[:,np.where(arr_x_avg < np.nanmedian(arr_x_avg))[0]] = 0
-    tmp_global_bkg = sigma_clipped_stats(img[img_mask==0].flatten(), sigma_upper = 2., maxiters = 5)[1]
-    if mask == True: return tmp_global_bkg, img_mask
-    else: return tmp_global_bkg
+    img_mask[np.where(arr_y_avg < np.nanmedian(arr_y_avg))[0], :] = 0
+    img_mask[:, np.where(arr_x_avg < np.nanmedian(arr_x_avg))[0]] = 0
+    tmp_global_bkg = sigma_clipped_stats(img[img_mask == 0].flatten(), sigma_upper=2., maxiters=5)[1]
+    if mask:
+        return tmp_global_bkg, img_mask
+    return tmp_global_bkg
