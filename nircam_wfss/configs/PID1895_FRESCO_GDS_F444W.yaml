@@ -1,9 +1,9 @@
 # =============================================================================
 # NIRCam WFSS Pipeline Configuration
-# PID 3577 – CONGRESS Survey, GOODS-North, F356W grism
+# PID 1895 – FRESCO Survey, GOODS-South, F444W grism
 # =============================================================================
 # Usage:
-#   python run_pipeline.py configs/PID3577_CONGRESS_GDN_F356W.yaml
+#   python run_pipeline.py configs/PID1895_FRESCO_GDS_F444W.yaml
 #
 # All paths may be absolute or relative to the working directory.
 # Keys not recognised by PipelineConfig are silently ignored.
@@ -12,28 +12,28 @@
 # ---------------------------------------------------------------------------
 # Programme metadata
 # ---------------------------------------------------------------------------
-pid: 3577
+pid: 1895
 
 # ---------------------------------------------------------------------------
 # Source catalogue
 # ---------------------------------------------------------------------------
-source_catalog_path: /xdisk/timeifler/jiachuanxu/jwst/fengwu_catalog/v2_gdn_congress_line_list_low-ground-z_Pa_Br_jades_dr5.fits
+source_catalog_path: /xdisk/timeifler/jiachuanxu/jwst/fengwu_catalog/v2_gds_fresco_line_list_low-ground-z_Pa_Br_jades_dr5.fits
 
 # ---------------------------------------------------------------------------
 # Data directories and file patterns
 # ---------------------------------------------------------------------------
-data_dir:         /xdisk/timeifler/jiachuanxu/jwst/congress
+data_dir:         /xdisk/timeifler/jiachuanxu/jwst/fresco_gds
 
 # NIRCam SW direct-imaging rate files
 # Note that direct image is only used for astrometry calibration. If the astrometry table
 # has already been generated and saved to disk, you can skip direct image reduction and 
 # astrometry stars extraction
-direct_image_dir:            /xdisk/timeifler/jiachuanxu/jwst/congress/direct_imaging
-direct_image_filename_fmt:   "jw*_nrc[a-b][1-4]_rate.fits"
+direct_image_dir:            /xdisk/timeifler/jiachuanxu/jwst/fresco_gds/direct_imaging
+direct_image_filename_fmt:   "jw01895001*_nrc[a-b][1-4]_rate.fits"
 
 # NIRCam LW grism rate files (stage-1 output)
-grism_data_dir:    /xdisk/timeifler/jiachuanxu/jwst/congress/grism_F356W
-grism_filename_fmt: "jw*nrc[ab]long_rate.fits"
+grism_data_dir:    /xdisk/timeifler/jiachuanxu/jwst/fresco_gds/grism_F444W
+grism_filename_fmt: "jw01895001*nrc[ab]long_rate.fits"
 
 # ---------------------------------------------------------------------------
 # Imaging mosaic (for direct-image cutouts in 1D extraction diagnostic plots)
@@ -41,13 +41,13 @@ grism_filename_fmt: "jw*nrc[ab]long_rate.fits"
 image_mosaic_dir:          /xdisk/timeifler/jiachuanxu/jwst/jades/mosaics
 image_mosaic_filename_fmt: "hlsp_jades_jwst_nircam_%s_%s_v5.0_drz.fits"
 image_mosaic_rgb_bands:    [F115W, F200W, F444W]
-image_mosaic_field:        goods-n
+image_mosaic_field:        goods-s
 
 # ---------------------------------------------------------------------------
 # Intermediate calibration and output directories
 # ---------------------------------------------------------------------------
 # Where lv1.5 grism files, astrometry catalogs, plots, and POM catalogs live
-calibrated_dir: /xdisk/timeifler/jiachuanxu/jwst/congress/grism_cal
+calibrated_dir: /xdisk/timeifler/jiachuanxu/jwst/fresco_gds/grism_cal
 
 # F. Sun's supportive calibration data (dispersion solution, sensitivity,
 # super-sky backgrounds, speccov files for partial POM coverage)
@@ -58,18 +58,18 @@ default_POM_trans_dir: /home/u17/jiachuanxu/JWST_KL/nircam_wfss/data/GRISM_NIRCA
 
 # Astrometry calibration table – if the file exists it is loaded directly;
 # if not, DAOFIND is run on the SW images and the table is generated.
-astrometry_cal_table: /home/u17/jiachuanxu/JWST_KL/nircam_wfss/data/FSun_cal/PID_3577_SW_wavecal.dat
+astrometry_cal_table: /home/u17/jiachuanxu/JWST_KL/nircam_wfss/data/FSun_cal/PID_1895_GDS_SW_wavecal.dat
 
 # External astrometry reference catalogue (e.g. calibrated to Gaia via HST)
 astrometry_ref_table: /home/u17/jiachuanxu/JWST_KL/nircam_wfss/data/FSun_cal/goods_charge_F160W_daofind.cat
 
 # Output directory for extracted 2-D / 1-D spectra and emission-line cutouts
-extract_dir: /xdisk/timeifler/jiachuanxu/jwst/congress/extract
+extract_dir: /xdisk/timeifler/jiachuanxu/jwst/fresco_gds/extract
 
 # ---------------------------------------------------------------------------
 # Reduction parameters
 # ---------------------------------------------------------------------------
-grism_filter:  F356W     # NIRCam filter for grism observations
+grism_filter:  F444W     # NIRCam filter for grism observations
 n_procs:       20        # number of parallel worker processes
 
 # Cross-dispersion aperture half-width used during 2D spectral extraction (pix)
@@ -83,6 +83,8 @@ psf_oversample: 4
 
 # Overwrite existing lv1.5 / background files (False = skip if present)
 overwrite: false
+
+# Overwrite existing extracted 2D spectra files (False = skip if present)
 overwrite_spec2d: true
 
 # Brightness unit for the stacked extracted 2D spectra. Options: "DN/s" or "mJy"

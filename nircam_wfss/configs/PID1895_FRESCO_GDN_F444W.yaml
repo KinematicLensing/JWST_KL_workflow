@@ -25,6 +25,9 @@ source_catalog_path: /xdisk/timeifler/jiachuanxu/jwst/fengwu_catalog/v2_gdn_fres
 data_dir:         /xdisk/timeifler/jiachuanxu/jwst/fresco_gdn
 
 # NIRCam SW direct-imaging rate files
+# Note that direct image is only used for astrometry calibration. If the astrometry table
+# has already been generated and saved to disk, you can skip direct image reduction and 
+# astrometry stars extraction
 direct_image_dir:            /xdisk/timeifler/jiachuanxu/jwst/fresco_gdn/direct_imaging
 direct_image_filename_fmt:   "jw01895002*_nrc[a-b][1-4]_rate.fits"
 
@@ -37,7 +40,7 @@ grism_filename_fmt: "jw01895002*nrc[ab]long_rate.fits"
 # ---------------------------------------------------------------------------
 image_mosaic_dir:          /xdisk/timeifler/jiachuanxu/jwst/jades/mosaics
 image_mosaic_filename_fmt: "hlsp_jades_jwst_nircam_%s_%s_v5.0_drz.fits"
-image_mosaic_rgb_bands:    [F090W, F200W, F444W]
+image_mosaic_rgb_bands:    [F115W, F200W, F444W]
 image_mosaic_field:        goods-n
 
 # ---------------------------------------------------------------------------
@@ -80,3 +83,21 @@ psf_oversample: 4
 
 # Overwrite existing lv1.5 / background files (False = skip if present)
 overwrite: false
+overwrite_spec2d: true
+
+# Brightness unit for the stacked extracted 2D spectra. Options: "DN/s" or "mJy"
+bunit_spec2d: "DN/s"
+
+# Coadd method for combining multiple grism exposures in the emission line cutout
+# Options are "drizzle" or "simple"
+# "drizzle": re-sample each exposure into a Equatorial coordinate grid.
+# "simple": no re-sample, keep the original pixel size, and stack in detector frame,
+#           no RA-DEC alignment. PA angle of the +X axis is provided.
+coadd_method: "simple"
+cutout_size_simple: 31
+# Drizzle output pixel scale (arcsec/pix) — controls output grid resolution
+finalscale_drizzle: 0.035
+# Drizzle drop-size fraction (pixfrac argument to Drizzle.add_image)
+pixfrac_drizzle: 0.8
+# Drizzle cutout size in pixels
+cutout_size_drizzle: 61
