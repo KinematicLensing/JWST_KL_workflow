@@ -131,6 +131,91 @@ def fit_disp_order23(
         + poly3(xpix, ypix, c01, c02, c03, c04, c05, c06, c07, c08, c09, c10) * dx**2
     )
 
+# ---------------------------------------------------------------------------
+# High-level helper: get the detector position of a emission line, and its 
+# local dispersion angle
+# ---------------------------------------------------------------------------
+def get_position_ang_dispang_at_wave(x0, y0, obswave, grism_conf, module, pupil, 
+                                     delta_wave=0.005, wcs_transform=None, velosys=0.0):
+    """
+    Return the detector position of an emission line and its local dispersion angle.
+
+    Parameters
+    ----------
+    x0, y0:
+        Source position in the direct image (pixels).
+    obswave:
+        Observed wavelength of the emission line (µm).
+    grism_conf:
+        ``GrismConf`` instance with dispersion and trace polynomial coefficients.
+    module:
+        NIRCam module (``'A'`` or ``'B'``).
+    pupil:
+        Grism pupil: ``'R'`` (GRISMR, disperses along X) or ``'C'`` (GRISMC,
+        disperses along Y).
+    delta_wave:
+        Small wavelength step (µm) used to compute the local dispersion angle
+        via finite difference.
+    wcs_transform:
+        Optional ``[WCS_input, WCS_output]`` pair.  When provided, the
+        dispersion angle is computed in the output WCS frame (e.g. a
+        sky-aligned drizzled mosaic) rather than the native detector frame.
+        Steps: predict line positions at ``obswave ± delta_wave`` in detector
+        pixels, convert to sky via ``WCS_input``, project into the output
+        frame via ``WCS_output``, then take ``arctan2(dy_out, dx_out)``.
+    velosys:
+        Systemic velocity (km/s) applied to the wavelength before solving the
+        dispersion relation.  Default 0 (no shift).
+
+    Returns
+    -------
+    xs, ys:
+        Predicted detector position of the emission line (pixels), or
+        ``None`` if ``obswave`` falls outside the modelled wavelength range.
+    disp_ang:
+        Local dispersion angle at the line position (radians).
+    """
+    ### Load dispersion solutions
+    disp_coeff  = grism_conf.get_disp_coeff(module, pupil)
+    trace_coeff = grism_conf.get_trace_coeff(module, pupil)
+    dxs, dys, wavs = grism_conf_preparation(
+        x0=x0, y0=y0, pupil=pupil,
+        fit_opt_fit=trace_coeff, w_opt=disp_coeff,
+    )
+    wavs_bary = (1.0 + velosys / 299792458.0) * wavs
+
+    if obswave < wavs_bary.min() or obswave > wavs_bary.max():
+        return None
+
+    interp_dx = interpolate.interp1d(
+        wavs_bary, dxs, kind="linear", bounds_error=False, fill_value=np.nan
+    )
+    interp_dy = interpolate.interp1d(
+        wavs_bary, dys, kind="linear", bounds_error=False, fill_value=np.nan
+    )
+    dx_line = float(interp_dx(obswave))
+    dy_line = float(interp_dy(obswave))
+    if np.isnan(dx_line) or np.isnan(dy_line):
+        return None
+    # predicted position of the emission line in the grism image
+    xs = x0 + dx_line
+    ys = y0 + dy_line
+
+    ### Calculate the local dispersion angle at the grism WCS
+    dx_lo = float(interp_dx(obswave - delta_wave))
+    dy_lo = float(interp_dy(obswave - delta_wave))
+    dx_hi = float(interp_dx(obswave + delta_wave))
+    dy_hi = float(interp_dy(obswave + delta_wave))
+    if wcs_transform:
+        wcs_input, wcs_output = wcs_transform
+        coords_lo = wcs_input.all_pix2world([[x0 + dx_lo, y0 + dy_lo]], 0)[0]
+        coords_hi = wcs_input.all_pix2world([[x0 + dx_hi, y0 + dy_hi]], 0)[0]
+        ox_lo, oy_lo = wcs_output.all_world2pix([[coords_lo[0], coords_lo[1]]], 0)[0]
+        ox_hi, oy_hi = wcs_output.all_world2pix([[coords_hi[0], coords_hi[1]]], 0)[0]
+        dispang = float(np.angle((ox_hi - ox_lo) + 1j * (oy_hi - oy_lo)))
+    else:
+        dispang = float(np.angle((dx_hi - dx_lo) + 1j * (dy_hi - dy_lo)))
+    return xs, ys, dispang
 
 # ---------------------------------------------------------------------------
 # High-level helper: prepare dxs, dys, wavelengths for one source position
@@ -222,7 +307,30 @@ def grism_conf_preparation(
 
 class GrismConf:
     """
-    Container for grism dispersion and trace polynomial coefficients and sensitivity curve.
+    Container for grism dispersion, trace, and sensitivity calibrations.
+
+    Loads calibration files for all four module/grism combinations (AR, AC, BR,
+    BC) on construction.  Use ``get_disp_coeff``, ``get_trace_coeff``, and
+    ``get_sensitivity`` to retrieve per-combination data.
+
+    Parameters
+    ----------
+    filter:
+        NIRCam filter name (e.g. ``'F444W'``, ``'F356W'``).  Determines the
+        wavelength range and which sensitivity curve files are loaded.
+    config:
+        ``PipelineConfig`` instance; must expose ``cali_support_dir`` pointing
+        to the directory that holds the calibration data files.
+
+    Attributes
+    ----------
+    WRANGE:
+        2-element array ``[wave_min, wave_max]`` (µm) for this filter.
+    disp_filter:
+        Filter name used to look up the dispersion coefficient files.  Some
+        filters share coefficients (e.g. ``'F356W'`` → ``'F322W2'``).
+    list_mod_pupil:
+        List of module/grism keys: ``['AR', 'AC', 'BR', 'BC']``.
     """
     __WRANGE__ = {
         'F444W': np.array([3.8, 5.1]),
@@ -246,18 +354,14 @@ class GrismConf:
         filter: str,
         config: dict,
     ) -> None:
-        """ Initialize the GrismConf object with the given parameters.
-        Parameters:
-            filter:
-                Grism filter name, e.g. 'F356W'.
-            config:
-                Configuration dictionary containing
-        """
+        """Initialize all calibration arrays for this filter and config."""
         self.filter = filter # filter for transmission
         # Default to full LW range if filter not recognized
         self.WRANGE = self.__WRANGE__.get(filter, np.array([2.4, 5.1]))
         self.disp_filter = self.__DISP_FILTER__.get(filter) # filter for dispersion
         self.config = config
+        self.finalscale_drizzle = getattr(config, 'finalscale_drizzle', 0.035)
+        self.pixfrac_drizzle    = getattr(config, 'pixfrac_drizzle',    0.8)
 
         self.list_mod_pupil = []
         self.list_disp_coeff = []
@@ -271,19 +375,24 @@ class GrismConf:
                 self.sensitivity.append(self._load_sens(module, grism))
 
     def _load_disp(self, module, grism):
-        """ Load the polynomial coefficients of spectral tracing model solution
-            dy(x0, y0, dx), where dx = x_s - x0, dy = y_s - y0
-        for the given module and grism. The coefficients are passed to `fit_disp_order23`.
-        Parameters:
-            module:
-                NIRCam module ('A' or 'B').
-            grism:
-                Grism name ('R' or 'C').
-        Returns:
-            coeff_bestfit:
-                1-D array of best-fitting trace polynomial coefficients for fit_disp_order23.
-            coeff_error:
-                1-D array of error of trace polynomial coefficients for fit_disp_order23.
+        """
+        Load spectral-trace polynomial coefficients for ``fit_disp_order23``.
+
+        The file encodes ``dy(x0, y0, dx)`` where dx = x_s − x0, dy = y_s − y0.
+
+        Parameters
+        ----------
+        module:
+            NIRCam module (``'A'`` or ``'B'``).
+        grism:
+            Grism identifier (``'R'`` or ``'C'``).
+
+        Returns
+        -------
+        coeff_bestfit:
+            1-D array of 30 best-fit trace polynomial coefficients.
+        coeff_error:
+            1-D array of 30 coefficient uncertainties.
         """
         path = os.path.join(
             self.config.cali_support_dir,
@@ -293,19 +402,24 @@ class GrismConf:
         return tb["col0"].data, tb["col1"].data
     
     def _load_displ(self, module, grism):
-        """ Load the polynomial coefficients of dispersion wavelength solution
-            dx(x0, y0, lambda_s)
-        for the given module and grism. The coefficients are passed to `fit_disp_order32`.
-        Parameters:
-            module:
-                NIRCam module ('A' or 'B').
-            grism:
-                Grism name ('R' or 'C').
-        Returns:
-            coeff_bestfit:
-                1-D array of best-fitting trace polynomial coefficients for fit_disp_order32.
-            coeff_error:
-                1-D array of error of trace polynomial coefficients for fit_disp_order32.
+        """
+        Load dispersion wavelength-solution coefficients for ``fit_disp_order32``.
+
+        The file encodes ``dx(x0, y0, lambda_s)``.
+
+        Parameters
+        ----------
+        module:
+            NIRCam module (``'A'`` or ``'B'``).
+        grism:
+            Grism identifier (``'R'`` or ``'C'``).
+
+        Returns
+        -------
+        coeff_bestfit:
+            1-D array of 16 best-fit dispersion polynomial coefficients.
+        coeff_error:
+            1-D array of 16 coefficient uncertainties.
         """
         path = os.path.join(
             self.config.cali_support_dir,
@@ -315,16 +429,20 @@ class GrismConf:
         return tb["col0"].data, tb["col1"].data
     
     def _load_sens(self, module, grism):
-        """ Load the sensitivity curve for the given module and grism. 
-        Parameters:
-            module:
-                NIRCam module ('A' or 'B').
-            grism:
-                Grism name ('R' or 'C').
-        Returns:
-            interpolate_sens:
-                A callable function that takes wavelength as input and returns 
-                the sensitivity (DN/s/Jy).
+        """
+        Load the flux-sensitivity curve for a module/grism combination.
+
+        Parameters
+        ----------
+        module:
+            NIRCam module (``'A'`` or ``'B'``).
+        grism:
+            Grism identifier (``'R'`` or ``'C'``).
+
+        Returns
+        -------
+        interpolate_sens:
+            Callable that maps wavelength (µm) → sensitivity (DN/s/Jy).
         """
         path = os.path.join(
             self.config.cali_support_dir,
@@ -337,41 +455,48 @@ class GrismConf:
         return interpolate_sens
     
     def get_disp_coeff(self, module, grism):
-        """ Get the dispersion polynomial coefficients for the given module and grism.
-        Parameters:
-            module:
-                NIRCam module ('A' or 'B').
-            grism:
-                Grism name ('R' or 'C').
-        Returns:
-            1-D array of dispersion polynomial coefficients for fit_disp_order32.
+        """
+        Return the 16 dispersion polynomial coefficients for ``fit_disp_order32``.
+
+        Parameters
+        ----------
+        module:
+            NIRCam module (``'A'`` or ``'B'``).
+        grism:
+            Grism identifier (``'R'`` or ``'C'``).
         """
         idx = self.list_mod_pupil.index(f'{module}{grism}')
         return self.list_disp_coeff[idx]
 
     def get_trace_coeff(self, module, grism):
-        """ Get the trace polynomial coefficients for the given module and grism.
-        Parameters:
-            module:
-                NIRCam module ('A' or 'B').
-            grism:
-                Grism name ('R' or 'C').
-        Returns:
-            1-D array of trace polynomial coefficients for fit_disp_order23.
+        """
+        Return the 30 trace polynomial coefficients for ``fit_disp_order23``.
+
+        Parameters
+        ----------
+        module:
+            NIRCam module (``'A'`` or ``'B'``).
+        grism:
+            Grism identifier (``'R'`` or ``'C'``).
         """
         idx = self.list_mod_pupil.index(f'{module}{grism}')
         return self.list_trace_coeff[idx]
     
     def get_sensitivity(self, module, grism):
-        """ Get the sensitivity curve for the given module and grism.
-        Parameters:
-            module:
-                NIRCam module ('A' or 'B').
-            grism:
-                Grism name ('R' or 'C').
-        Returns:
-            A callable function that takes wavelength as input and returns 
-            the sensitivity (DN/s/Jy).
+        """
+        Return the sensitivity callable for the given module/grism combination.
+
+        Parameters
+        ----------
+        module:
+            NIRCam module (``'A'`` or ``'B'``).
+        grism:
+            Grism identifier (``'R'`` or ``'C'``).
+
+        Returns
+        -------
+        interpolate_sens:
+            Callable that maps wavelength (µm) → sensitivity (DN/s/Jy).
         """
         idx = self.list_mod_pupil.index(f'{module}{grism}')
         return self.sensitivity[idx]
