@@ -22,7 +22,17 @@ Section 3 – Direct-image cutout helpers and 1-D extraction
 Section 4 – 2-D emission-line cutout extraction
     ``store_all_2d_emline``        – combine per-frame emission-line cutouts into FITS.
     ``_compute_grism_psf_frame``   – compute a stpsf PSF model for one grism frame.
-    ``extract_2d_emline_worker``   – pool-safe driver: drizzle-coadd emission-line cutouts.
+    ``extract_2d_emline_worker_drizzle``– pool-safe driver: drizzle-coadd emission-line cutouts.
+    ``extract_2d_emline_worker_simple`` - pool-safe driver: simple-coadd emission line cutouts without re-sampling. 
+
+Comment about `GS_V3_PA`:
+The `GS_V3_PA` equals the roll angle (northward from west) of the Sci-frame image for
+non-obvious reasons. The definition of `GS_V3_PA` is the V3 axis position angle defined
+eastward of north, measured at guide star region in NIRCam. Note that the Y axes of JWST
+detectors generally are misaligned with the V3 axis, but NIRCam happens to sit at the 
+center of JWST focal plane and its Y axis is only offset from V3 by ~0.02 degrees.
+Therefore the roll angle (angle of +X from west to north) determination of this pipeline 
+can not be applied to other JWST instruments without modification.
 """
 
 from __future__ import annotations
@@ -44,11 +54,16 @@ import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
 from scipy import ndimage, optimize, interpolate
 
-from nircam_wfss.dispersion import grism_conf_preparation
+from nircam_wfss.dispersion import grism_conf_preparation, get_position_ang_dispang_at_wave
 from nircam_wfss.plotting import corner_text
 from nircam_wfss.dispersion import GrismConf
 from nircam_wfss.config import EML_LAB, NIRCAM_LW_PIXSCALE
 from drizzle.resample import Drizzle
+
+VALID_X_LEFT = 5
+VALID_X_RIGHT = 2047 - 6
+VALID_Y_BOTTOM = 5
+VALID_Y_TOP = 2047 - 6
 
 
 '''gaussian function'''
@@ -69,9 +84,11 @@ def extract_2d_spec(
     img_wht: np.ndarray,
     img_dq: np.ndarray,
     header: fits.Header,
+    pupil: str,
+    module: str, 
     img_line: np.ndarray | None = None,
     aper: float = 10.0,
-    pupil: str = "R",
+    unified_chirality: bool = True,
 ) -> fits.HDUList:
     """
     Extract a 2-D spectrum from one dispersed slitless spectroscopic image.
@@ -79,6 +96,18 @@ def extract_2d_spec(
     The extraction uses a simple rectangular aperture centred on the
     wavelength trace.  Sub-pixel shifts along the cross-dispersion axis are
     corrected with a linear (order-1) ``scipy.ndimage.shift``.
+
+    Comment on the output spectrum orientation or chirality: given the sophisticated
+    design of JWST NIRCam WFSS and the methodology of this function, the output 
+    spectra have a chirality. Defining the Z axis as the cross-product of the SCI 
+    frame +Z = (+X) x (+Y), and putting the wavelength direction +W and the cross-
+    dispersion direction +C on the X-Y plane, then the chirality is +1 if 
+            [ (+W) x (+C) ] * (+Z) > 0,
+    and -1 if otherwise. This doesn't matter for redshift measurement, but matters
+    for morphology measurement, and kinematic lensing modeling in particular, which
+    is sensitive to the direction of the dispersion, and requires consistent position 
+    angle definition between grism and imaging, and also a convention consistent with 
+    the WCS.
 
     Parameters
     ----------
@@ -88,7 +117,8 @@ def extract_2d_spec(
         ``(wave_min, wave_max)`` in µm defining the extraction wavelength
         range.
     x0, y0:
-        Source position in the direct image (pixels).
+        Source position in the direct image (pixels). Should be
+        the position after astrometric correction and POM modulation.
     dxs, dys:
         Pixel offsets of the wavelength trace from (x0, y0), computed by
         :func:`~nircam_wfss.dispersion.grism_conf_preparation`.
@@ -101,15 +131,25 @@ def extract_2d_spec(
     header:
         Primary header of the grism FITS file (used to copy exposure
         metadata into the output).
-    img_line:
-        Continuum-subtracted emission-line image.  If ``None``, the LINE2D
-        extension is filled with zeros.
-    aper:
-        Half-aperture width in the cross-dispersion direction (pixels).
-    pupil:
+    pupil: str
         Grism pupil: ``'R'`` (GRISMR, disperses along X) or ``'C'``
         (GRISMC, disperses along Y).
-
+    module: str
+        Detector module: ``'A'`` or ``'B'``.
+    img_line: np.ndarray | None
+        Continuum-subtracted emission-line image.  If ``None``, the LINE2D
+        extension is filled with zeros.
+    aper: float, optional
+        Half-aperture width in the cross-dispersion direction (pixels).
+        Defaults to 10, which corresponds to a 21-pixel wide aperture.
+    unified_chirality: bool, optional
+        If ``True``, the output spectra are flipped along the cross-dispersion 
+        axis if the module-pupil combination is not AR, such that the output
+        spectra is equivalent to AR up to a roll angle rotation of (0, 360) deg.
+        If ``False``, the output spectra are not flipped such that the cross-
+        dispersion direction is always +X or +Y in the original SCI frame. 
+        For the ease of kinematic lensing modeling, we recommend set to True,
+        which is the default behavior.
     Returns
     -------
     hdul:
@@ -123,9 +163,12 @@ def extract_2d_spec(
         and detector boundaries.
     KeyError
         If ``pupil`` is not ``'R'`` or ``'C'``.
+        If ``module`` is not ``'A'`` or ``'B'``.
     """
     if pupil not in ("C", "R"):
         raise KeyError('pupil must be "R" or "C"')
+    if module not in ("A", "B"):
+        raise KeyError('module must be "A" or "B"')
 
     w_min, w_max = wrange
     x_on_g = dxs + x0   # trace x coordinates on the grism image
@@ -136,14 +179,14 @@ def extract_2d_spec(
     if pupil == "R":
         args_eff = np.where(
             (wave >= w_min) & (wave <= w_max)
-            & (x_on_g >= 5) & (x_on_g <= 2047 - 6)
-            & (y_on_g >= aper_int) & (y_on_g <= 2047 - 6 - aper_int)
+            & (x_on_g >= VALID_X_LEFT) & (x_on_g <= VALID_X_RIGHT)
+            & (y_on_g >= VALID_Y_BOTTOM + aper_int) & (y_on_g <= VALID_Y_TOP - aper_int)
         )
     else:  # 'C'
         args_eff = np.where(
             (wave >= w_min) & (wave <= w_max)
-            & (x_on_g >= aper_int) & (x_on_g <= 2047 - 6 - aper_int)
-            & (y_on_g >= 5) & (y_on_g <= 2047 - 6)
+            & (x_on_g >= VALID_X_LEFT + aper_int) & (x_on_g <= VALID_X_RIGHT - aper_int)
+            & (y_on_g >= VALID_Y_BOTTOM) & (y_on_g <= VALID_Y_TOP)
         )
 
     if np.size(args_eff) <= 20:
@@ -161,7 +204,12 @@ def extract_2d_spec(
         img_line = np.zeros_like(img)
 
     for i, j in enumerate(args_eff[0]):
+        # i: index of wavelength pixel in output arrays (tmp_spec_2d, etc.)
+        # j: index of wavelength pixel in input arrays (dxs, dys, wave)
         if pupil == "R":
+            # for each y-aperture slicing through dx trace, shift the y-aper along y 
+            # to correct for sub-pixel trace position, then copy the shifted slice 
+            # to output arrays. 
             tmp_x  = int(x_on_g[j])
             tmp_y1 = int(y_on_g[j] - aper_int - 1)
             tmp_y2 = int(y_on_g[j] + aper_int + 2)
@@ -171,12 +219,16 @@ def extract_2d_spec(
                 arr.T[tmp_x, tmp_y1:tmp_y2] = ndimage.shift(
                     arr.T[tmp_x, tmp_y1:tmp_y2], shift_sub, order=1, mode="wrap"
                 )
+            # tmp_*_2d are of dimension (n_wave, n_cross), where n_cross direction is +Y
             tmp_spec_2d[i] = img.T[tmp_x][tmp_y1 + 1 : tmp_y2 - 1]
             tmp_wht_2d[i]  = img_wht.T[tmp_x][tmp_y1 + 1 : tmp_y2 - 1]
             tmp_dq_2d[i]   = img_dq.T[tmp_x][tmp_y1 + 1 : tmp_y2 - 1]
             tmp_line_2d[i] = img_line.T[tmp_x][tmp_y1 + 1 : tmp_y2 - 1]
 
         else:  # 'C'
+            # for each x-aperture slicing through dy trace, shift the x-aper along x 
+            # to correct for sub-pixel trace position, then copy the shifted slice 
+            # to output arrays. 
             tmp_y  = int(y_on_g[j])
             tmp_x1 = int(x_on_g[j] - aper_int - 1)
             tmp_x2 = int(x_on_g[j] + aper_int + 2)
@@ -186,22 +238,44 @@ def extract_2d_spec(
                 arr[tmp_y, tmp_x1:tmp_x2] = ndimage.shift(
                     arr[tmp_y, tmp_x1:tmp_x2], shift_sub, order=1, mode="wrap"
                 )
+            # tmp_*_2d are of dimension (n_wave, n_cross), where n_cross direction is +X
             tmp_spec_2d[i] = img[tmp_y, tmp_x1 + 1 : tmp_x2 - 1]
             tmp_wht_2d[i]  = img_wht[tmp_y, tmp_x1 + 1 : tmp_x2 - 1]
             tmp_dq_2d[i]   = img_dq[tmp_y, tmp_x1 + 1 : tmp_x2 - 1]
             tmp_line_2d[i] = img_line[tmp_y, tmp_x1 + 1 : tmp_x2 - 1]
 
     # Transpose to (cross-dispersion, wavelength) orientation
+    # Direction of each dimensions of (cross-dispersion, wavelength) wrt SCI frame:
+    # 1. AR: (cross-dispersion, wavelength) = (+Y, +X) (chirality +1)
+    # 2. BR: (cross-dispersion, wavelength) = (+Y, -X) (chirality -1)
+    # 3. AC: (cross-dispersion, wavelength) = (+X, +Y) (chirality -1)
+    # 4. BC: (cross-dispersion, wavelength) = (+X, +Y) (chirality -1)
     tmp_spec_2d = tmp_spec_2d.T
     tmp_wht_2d  = tmp_wht_2d.T
     tmp_dq_2d   = tmp_dq_2d.T
     tmp_line_2d = tmp_line_2d.T
+    chirality = 1 if (module, pupil) == ("A", "R") else -1
+    if unified_chirality and (f"{module}{pupil}" != "AR"):
+        # Now, we will flip the spectra along the cross-dispersion direction if
+        # the chirality is -1, so that the output spectra chirality is equivalent
+        # to GRISM AR up to a roll angle difference (0, 360) degrees.
+        tmp_spec_2d = tmp_spec_2d[::-1]
+        tmp_wht_2d  = tmp_wht_2d[::-1]
+        tmp_dq_2d   = tmp_dq_2d[::-1]
+        tmp_line_2d = tmp_line_2d[::-1]
+        chirality = 1
+        # And now the directions are
+        # 1. AR: (cross-dispersion, wavelength) = (+Y, +X) (chirality +1)
+        # 2. BR: (cross-dispersion, wavelength) = (-Y, -X) (chirality +1)
+        # 3. AC: (cross-dispersion, wavelength) = (-X, +Y) (chirality +1)
+        # 4. BC: (cross-dispersion, wavelength) = (-X, +Y) (chirality +1)
 
     # --- Build output FITS ---
     hdu = fits.PrimaryHDU()
     hdu.header["X0"]     = (np.float32(x0), "Reference position X in direct image")
     hdu.header["Y0"]     = (np.float32(y0), "Reference position Y in direct image")
     hdu.header["AUTHOR"] = ("Jiachuan Xu", "Author of this file")
+    hdu.header["CHIRAL"] = (chirality, "Trace chirality: +1 or -1")
     hdu.header["TIME"]   = (
         time.strftime("%Y/%m/%d %H:%M:%S", time.localtime()), "Time of Creation"
     )
@@ -218,7 +292,7 @@ def extract_2d_spec(
             hdu.header[key] = header.cards[key][1:]
 
     hdu_sci = fits.ImageHDU(np.float32(tmp_spec_2d), name="SPEC2D")
-    hdu_sci.header["WAVE_1"]   = (float(wave[args_eff[0][1]]),
+    hdu_sci.header["WAVE_1"]   = (float(wave[args_eff[0][0]]),
                                   "Wavelength (um) of first pixel")
     hdu_sci.header["D_WAVE"]   = (float(np.mean(np.diff(wave[args_eff[0]]))),
                                   "Wavelength step (um) per pixel")
@@ -267,10 +341,15 @@ def store_all_2d_spec(
     coord=None,
     grism_filter: str | None = None,
     info_table=None,
-    overwrite: bool = True,
+    overwrite: bool = False,
 ) -> fits.HDUList:
     """
     Combine per-exposure 2-D spectral extractions into one FITS file.
+    Each input spectrum FITS file contains the extensions: ``PRIMARY``, 
+    ``SPEC2D``, ``WHT2D``, ``DQ2D``, ``LINE2D`` (optional), and ``WAVE``.
+    All the extensions except the primary header are concatenated into 
+    the output FITS with new extension names like ``SPEC2D-0``, ``SPEC2D-1``, 
+    etc. The output file is written to `output` when ``overwrite=True``. 
 
     Parameters
     ----------
@@ -292,7 +371,7 @@ def store_all_2d_spec(
         A single-row ``astropy.table.Row`` whose columns are written to the
         primary header under ``HIERARCH`` keywords.
     overwrite:
-        Overwrite the output file if it exists.
+        Overwrite the output file if it exists. Default is False.
 
     Returns
     -------
@@ -302,10 +381,10 @@ def store_all_2d_spec(
     ind_hdul = fits.HDUList([fits.PrimaryHDU()])
 
     for l, x in enumerate(fits_list):
-        # SPEC2D / WHT2D / DQ2D
+        # Primary header / SPEC2D / WHT2D / DQ2D / [LINE2D] / WAVE
         ind_hdul.append(x[1])
         ind_hdul[-1].header["EXTNAME"]  = "SPEC2D-%d" % l
-        for card in ("x0", "y0"):
+        for card in ("x0", "y0", "CHIRAL"):
             ind_hdul[-1].header[card] = x[0].header[card]
         ind_hdul[-1].header["PUPIL"]    = pupils[l]
         ind_hdul[-1].header["MODULE"]   = modules[l]
@@ -398,6 +477,10 @@ def resample_spec2d_wmin_wmax(
     simple loop.  It replaces the version in the original notebook that
     used global variables.
 
+    .. note::
+        This function is not called anywhere in the current codebase.
+        ``extract_2d_spec_worker`` inlines equivalent logic directly.
+
     Parameters
     ----------
     x:
@@ -414,13 +497,13 @@ def resample_spec2d_wmin_wmax(
     Returns
     -------
     tmp_spec_w_1:
-        Weighted-average 2-D SCI spectrum in this wavelength bin.
+        Weighted-mean spatial slice of SCI for this wavelength bin.
     tmp_wht_w_1:
-        Summed weight in this bin.
+        Summed weight for this bin.
     tmp_cov_w_1:
-        Binary coverage array (1 where weight > 0).
+        Integer coverage (1 where covered, 0 elsewhere).
     tmp_line_w_1:
-        Weighted-average LINE2D spectrum in this bin.
+        Weighted-mean spatial slice of LINE2D for this bin.
     """
     tmp_w_min = wave_sample[i]
     tmp_w_max = wave_sample[i + 1]
@@ -462,53 +545,88 @@ def extract_2d_spec_worker(
     aper: float,
     filter: str,
     extraction_dir: str,
+    bunit: str,
+    unified_chirality: bool = True,
+    overwrite: bool = False,
 ) -> None:
     """
-    Extract both 2-D and 1-D spectra for a single source.
+    Extract 2-D spectra for a single source.
 
-    This function calls :func:`extract_2d_spec` to get the 2-D spectrum, then
-    collapses it along the cross-dispersion axis to produce a 1-D spectrum.
+    This function calls :func:`extract_2d_spec` to get the 2-D spectrum, weight map, 
+    DQ map, and optionally the emission-line map for each grism frame where the source 
+    is observable, and then saves each spectrum as a FITS file in `extraction_dir`,
+    both as a per-frame compilation and co-adds grouped by module-pupil combination. 
+    This function is designed to be called via ``Pool.starmap`` or in a simple loop.
 
     Parameters
     ----------
     grism_idx_per_source:
-        List of grism frame indices where the source is observable.
-    POM_catalog_path_per_source:
-        List of paths to the POM catalogs where the source is observable.
+        List of grism frame indices where the source is observable. The index can be
+        used to find the corresponding grism frame in `all_v1p5_list`.
+    POM_path_per_source:
+        List of paths to the POM catalogs where the source is observable. The length
+        of this list should be the same as `grism_idx_per_source`.
     all_v1p5_list:
         List of paths to all v1.5 grism FITS files (used to find the corresponding 
         grism frame for each POM catalog).
     source_item:
         A single row from the source catalog table, containing at least
-        'id', 'x', and 'y' columns.
-
-    Returns
-    -------
-    None
-        The extracted spectra are saved to disk as FITS files.
+        'ID', 'RA', and 'DEC' columns.
+    grism_conf: `GrismConf`
+        Grism configuration object containing dispersion information.
+    aper: float
+        Aperture size for the extraction.
+    filter: str
+        Filter name for the extraction.
+    extraction_dir: str
+        Directory where the extracted spectra will be saved.
+    bunit: str
+        Brightness unit of the extracted spectra ('mJy' or 'DN/s').
+    unified_chirality: bool
+        Whether to unify the chirality of the output spectra across different 
+        module-pupil combinations. See the `unified_chirality` parameter in 
+        `extract_2d_spec` for details. Default is True.
+    overwrite: bool
+        Whether to overwrite existing 2D spectra files. Default is False.
     """
     if len(grism_idx_per_source) == 0: 
         print(' >> no spec found; skipping source %s' % source_item['ID'])
         return
+    assert len(grism_idx_per_source) == len(POM_path_per_source), \
+        "Length of grism_idx_per_source and POM_path_per_source should be the same."
     
     source_coord = SkyCoord(source_item["RA"], source_item["DEC"], unit=(u.deg, u.deg))
     source_id = source_item["ID"]
 
 
-    spec2d_list = [] # extracted 2D spectrum (HDUList) per frame
-    fits_name_list = [] # v1.5 filename per frame
-    module_list = [] # module per frame
-    pupil_list = [] # pupil per frame
+    spec2d_list     = [] # extracted 2D spectrum (HDUList) per frame
+    fits_name_list  = [] # v1.5 filename per frame
+    module_list     = [] # module per frame (A or B)
+    pupil_list      = [] # pupil per frame (R or C)
 
-    ''' 2D spectrum extraction '''
+    ''' 2D spectrum extraction & compilation
+    In this step, we will loop through each grism exposure frames and extract 2D spectrum 
+    for the source if the source is observable in that frame. Depending on the unit required,
+    the extracted 2D spectra may or may not be corrected for sensitivity. Each temporary 2D 
+    spectrum from each exposure will be saved in `spec2d_list`, and the corresponding grism 
+    filename, module, and pupil information will be saved in `fits_name_list`, `module_list`, 
+    and `pupil_list` respectively.
+    Note that each item in `spec2d_list` is a HDUList containing the 2D spectrum (SPEC2D), 
+    weight map (WHT2D), DQ map (DQ2D), and optionally the continuum-subtracted emission-line 
+    map (LINE2D) and wavelength table (WAVE) for that frame.
+    '''
     # For each grism frame where the source is observable
     for j, POM_fn in enumerate(POM_path_per_source):
+        # get the reduced v1.5 grism filename
         grism_fn = all_v1p5_list[grism_idx_per_source[j]]
+        # get the POM catalog for detector position in direct imaging
         POM_cat = ascii.read(POM_fn)
-        # Read grism data & header
-        image = fits.getdata(grism_fn, "sci")
+
+        ### Spectrum and Direct Image Position Retrieval
+        # Read grism data (w/ and w/o continuum subtraction) & header
+        image = fits.getdata(grism_fn, "sci") # grism w/ continuum
         try:
-            emline = fits.getdata(grism_fn, 'emline') ### Line-only Grism SCI image data
+            emline = fits.getdata(grism_fn, 'emline') # Line-only Grism SCI image data
         except KeyError:
             emline = image
         data_quality = fits.getdata(grism_fn, "dq")
@@ -540,12 +658,13 @@ def extract_2d_spec_worker(
             except Exception:
                 os.remove(tmp_path)  # another worker finished first; clean up our temp
             weight = fits.getdata(weight_path)
-        # Direct imaging positions 
+        # direct image position 
         item_POM = POM_cat[POM_cat['Index'] == source_id][0]
         x0 = item_POM['pixel_x']
         y0 = item_POM['pixel_y']
         print('%s(%.1f, %.1f) ' % (pupil, x0, y0), end = ' ')
 
+        ### Wavelength solution
         # spectral tracing parameters
         disp_coeff = grism_conf.get_disp_coeff(module, pupil)
         trace_coeff = grism_conf.get_trace_coeff(module, pupil)
@@ -561,7 +680,8 @@ def extract_2d_spec_worker(
                 x0 = x0, y0 = y0, dxs = dxs, dys = dys, wave = wavs, 
                 img_wht = weight, img_dq = data_quality,
                 img_line = emline, ## add EMLINE extension
-                header = primary_hd, pupil = pupil, aper = aper)
+                header = primary_hd, pupil = pupil, module = module, 
+                aper = aper, unified_chirality = unified_chirality)
         except ValueError:
             continue
         spec2d_list.append(tmp_spec_2D)
@@ -569,7 +689,9 @@ def extract_2d_spec_worker(
         fits_name_list.append(grism_fn)
         pupil_list.append(pupil)
 
-    ''' Save 2D spectra of all individual extraction (not correct for sensitivity) '''
+    ''' Save 2D spectra of all individual extraction 
+    Note that this step only save the extracted 2D spectra from each frame in DN/s.
+    '''
     if len(spec2d_list) == 0: 
         print(' >> no spec found; ')
         return
@@ -581,25 +703,39 @@ def extract_2d_spec_worker(
                             modules = module_list, paths = fits_name_list, 
                             output = specs2d_compile_name, coord = source_coord, 
                             grism_filter = filter,  info_table = source_item, 
-                            overwrite = True)
+                            overwrite = overwrite)
         print(' >> save all extracted spec2d ', end = '')
 
-    ''' Coadd 2D spectra from each frame (sensitivity corrected) by module-pupil separately '''
-    # Correct for sensitivity:
+    ''' Coadd 2D spectra from each frame by module-pupil separately 
+    Note that depending on the unit required, the coadded 2D spectra may or may not be 
+    corrected for sensitivity. If the unit is in mJy, the coadded 2D spectra will be 
+    corrected for sensitivity; if the unit is in DN/s, the coadded 2D spectra will not 
+    be corrected for sensitivity. The final coadded 2D spectra will be saved in 
+    `spec_2d_{filter}_ID{source_id}_{module-pupil|all}coadd.fits`
+    '''
+    # Correct for sensitivity (depending on the unit required). 
     for k, tmp_fits in enumerate(spec2d_list[:]):
-        tmp_f_sens = grism_conf.get_sensitivity(tmp_fits[1].header['MODULE'], 
-                                                tmp_fits[1].header['PUPIL'])
+        # default sensitivity: DN/s per Jy
         if len(tmp_fits) == 5:
             tmp_wavelength = tmp_fits[4].data['wavelength']
         else: # if has a line map
-            tmp_wavelength = tmp_fits[5].data['wavelength'] 
-            # change units in emline extension
-            spec2d_list[k][4].header['bunit'] = ('mJy', 'Brightness Unit')
-            spec2d_list[k][4].data = tmp_fits[4].data / tmp_f_sens(tmp_wavelength) * 1e3 # to unit of mJy
+            tmp_wavelength = tmp_fits[5].data['wavelength']
+        tmp_f_sens = grism_conf.get_sensitivity(tmp_fits[1].header['MODULE'], 
+                                                tmp_fits[1].header['PUPIL'])
+        if bunit == 'mJy':
+            f_sens = tmp_f_sens(tmp_wavelength) * 1.0e-3 # DN/s per mJy
+        elif bunit == 'DN/s':
+            f_sens = np.ones_like(tmp_wavelength)
+        else:
+            raise ValueError('bunit must be "mJy" or "DN/s"')
         # change units in spec2d extension
-        spec2d_list[k][1].header['bunit'] = ('mJy', 'Brightness Unit')
-        spec2d_list[k][1].data = tmp_fits[1].data / tmp_f_sens(tmp_wavelength) * 1e3     # to unit of mJy
-        spec2d_list[k][2].data = tmp_fits[2].data * tmp_f_sens(tmp_wavelength)**2 * 1e-6
+        spec2d_list[k][1].header['BUNIT'] = (bunit, 'Brightness Unit')
+        spec2d_list[k][1].data = tmp_fits[1].data / f_sens
+        spec2d_list[k][2].data = tmp_fits[2].data * f_sens**2
+        if len(tmp_fits) != 5:
+            # change units in emline extension
+            spec2d_list[k][4].header['BUNIT'] = (bunit, 'Brightness Unit')
+            spec2d_list[k][4].data = tmp_fits[4].data / f_sens
     # combine 2D spectra of all frames into one common grid
     d_wave = 0.001
     wave_sample = np.arange(grism_conf.WRANGE[0], grism_conf.WRANGE[1] + d_wave, d_wave)
@@ -615,6 +751,7 @@ def extract_2d_spec_worker(
     for module in ['A', 'B']:
         for pupil in ['R', 'C']:
             print(' >> coadd spec2d of %s%s ' % (module, pupil), end = '')
+            # which exposures in `spec2d_list` belong to this module-pupil combination?
             ind_spec2d_list = np.array([i for i, x in enumerate(spec2d_list) \
                 if x[1].header['MODULE'] == module and x[1].header['PUPIL'] == pupil], dtype=int)
             if len(ind_spec2d_list) == 0: 
@@ -627,6 +764,10 @@ def extract_2d_spec_worker(
                 arr_wht_2d  = np.zeros_like(arr_spec_2d)
                 arr_cov_2d  = np.zeros_like(arr_spec_2d)
                 arr_line_2d = np.zeros_like(arr_spec_2d)
+                # for each wavelength bin in the common grid, deposit the native spectrum
+                # by picking the native pixels that fall into this wavelength bin and taking 
+                # their weighted average.
+                # Note that this step does NOT re-sample!!!
                 for local_iexp, iexp in enumerate(ind_spec2d_list):
                     native_spec = spec2d_list[iexp][1].data
                     native_wave = spec2d_list[iexp][-1].data['wavelength']
@@ -639,6 +780,7 @@ def extract_2d_spec_worker(
                     for iwave in range(N_common_wave):
                         tmp_w_min = wave_sample[iwave]
                         tmp_w_max = wave_sample[iwave + 1]
+                        # Does NOT re-sample!!!
                         in_bin = (native_wave > tmp_w_min) & (native_wave <= tmp_w_max)
                         arg_in = tuple([in_bin])
                         tmp_spec_w = native_spec.T[arg_in]
@@ -654,14 +796,15 @@ def extract_2d_spec_worker(
                         arr_wht_2d[iwave, local_iexp]  = wht_sum
                         arr_cov_2d[iwave, local_iexp]  = np.int8(wht_sum != 0)
                         arr_line_2d[iwave, local_iexp] = np.nansum(tmp_line_w * tmp_wht_w, axis=0) / wht_sum
-                # sigma clip
+                # the coadded spectra are sigma-clipped and weighted averaged across the 
+                # exposures in each wavelength bin.
                 sigma_clip = SigmaClip(sigma = 2.5, maxiters = 5)
                 if arr_spec_2d.shape[1] > 2:
                     arr_spec_2d = sigma_clip(arr_spec_2d, axis = 1, masked = False)
                     arr_line_2d = sigma_clip(arr_line_2d, axis = 1, masked = False)
                 arr_wht_2d[np.where(np.isnan(arr_spec_2d))] = 0
                 arr_wht_2d[np.where(np.isnan(arr_line_2d))] = 0
-                ## weighted mean 2d spectra:
+                # weighted mean 2d spectra:
                 coadd_spec_2d = np.nansum(arr_spec_2d * arr_wht_2d, axis = 1) / np.nansum(arr_wht_2d, axis = 1) # sum_arr_wht_2d # 
                 coadd_wht_2d = np.nansum(arr_wht_2d, axis = 1)
                 coadd_cov_2d = np.nansum(arr_cov_2d, axis = 1)
@@ -669,7 +812,7 @@ def extract_2d_spec_worker(
                 # save coadded 2D spectrum of this module-pupil combination
                 tmp_tb_cov = Table(
                     names = ['index', 'name', 'x0', 'y0', 'module', 'pupil', 'DIFF_X', 'DIFF_Y', 
-                             'wave_0', 'wave_1', 'EFFEXPTM', 'GS_V3_PA'],
+                             'wave_0', 'wave_1', 'EFFEXPTM', 'GS_V3_PA', 'CHIRAL', 'DATE-BEG', 'DATE-END'],
                     data = [ind_spec2d_list,
                             [tmp_grism.split('/')[-1][:-16] for tmp_grism in fits_name_list[ind_spec2d_list]],
                             [x[0].header['x0'] for x in spec2d_list[ind_spec2d_list]],
@@ -685,7 +828,10 @@ def extract_2d_spec_worker(
                                 if np.any(np.sum(arr_wht_2d, axis=-1)[:, n_] != 0) else np.nan
                                 for n_ in range(N_exp)],
                             [x[0].header['EFFEXPTM'] for x in spec2d_list[ind_spec2d_list]],
-                            [x[0].header['GS_V3_PA'] for x in spec2d_list[ind_spec2d_list]]
+                            [x[0].header['GS_V3_PA'] for x in spec2d_list[ind_spec2d_list]],
+                            [x[0].header['CHIRAL'] for x in spec2d_list[ind_spec2d_list]],
+                            [x[0].header['DATE-BEG'] for x in spec2d_list[ind_spec2d_list]],
+                            [x[0].header['DATE-END'] for x in spec2d_list[ind_spec2d_list]],
                         ]
                 )
                 hdu = fits.PrimaryHDU()
@@ -701,7 +847,8 @@ def extract_2d_spec_worker(
                 hdu.header['pupil'] = (pupil, 'Pupil (R=GRISMR, C=GRISMC)')
                 for cardname in ['PROGRAM', 'OBSERVTN', 'OBSLABEL', 'OBSFOLDR', 'GS_V3_PA']:
                     if cardname in primary_hd: hdu.header[cardname] = primary_hd.cards[cardname][1:]
-                hdu.header['GS_V3_PA'] = (np.nanmean(tmp_tb_cov['GS_V3_PA']), 'Maximum exposure time [s]')
+                hdu.header['GS_V3_PA'] = (np.nanmean(tmp_tb_cov['GS_V3_PA']), 'V3 position angle of the grism pointing (deg)')
+                
                 ### copy source catalog information to primary header
                 hdu.header['COMMENTS'] = 'Belows are information taken from input catalog:'
                 for x in source_item.colnames:
@@ -723,6 +870,7 @@ def extract_2d_spec_worker(
                 hdu_sci.header['comments'] = ('wave = wave_1 + np.arange(0, NAXIS1, 1) * d_wave')
                 hdu_sci.header['pixscale'] = (NIRCAM_LW_PIXSCALE, 'Pixel scale in undispersed direction (arcsec)')
                 hdu_sci.header['aperture'] = (aper, 'Aperture radius in undispersed direction (pixel)')
+                hdu_sci.header['BUNIT'] = (bunit, 'Brightness Unit')
                 # weight extension
                 hdu_wht = fits.ImageHDU(coadd_wht_2d.T, name = 'WHT2D')
                 hdu_wht.header['comments'] = ('Weight image; ERR = WHT^(-0.5)')
@@ -734,6 +882,7 @@ def extract_2d_spec_worker(
                 hdu_line.data = coadd_line_2d.T
                 hdu_line.header['extname'] = 'LINE2D'
                 hdu_line.header['comments'] = ('Line-only image extracted on continuum-filtered 2D data')
+                hdu_line.header['BUNIT'] = (bunit, 'Brightness Unit')
                 # statistics tab
                 hdu_tab = fits.BinTableHDU(tmp_tb_cov, name = 'STATS')
                 hdu_tab.header['COMMENT'] = 'name:     name of simulated image'
@@ -751,7 +900,7 @@ def extract_2d_spec_worker(
                 hdul.writeto(sub_coadd_fn, overwrite = True)
                 print(' >> save module-pupil stacked spec2d; %s' % sub_coadd_fn)
 
-    ''' Coadd 2D spectra from each frame (sensitivity corrected) all combined '''
+    ''' Coadd 2D spectra from each frame all combined '''
     primary_hd = None
     all_spec_2d = None
     all_wht_2d = None
@@ -783,7 +932,7 @@ def extract_2d_spec_worker(
     all_line_2d = all_line_2d / all_wht_2d
     primary_hd["N_coadd"] = (len(all_table), 'Number of coadded frames')
     primary_hd["EFFEXPTM"] = (np.nansum(all_table['EFFEXPTM']), 'Maximum exposure time [s]')
-    primary_hd["GS_V3_PA"] = (np.nanmean(all_table['GS_V3_PA']), 'Maximum exposure time [s]')
+    primary_hd["GS_V3_PA"] = (np.nanmean(all_table['GS_V3_PA']), 'V3 position angle of the grism pointing (deg)')
     primary_hd["N_R"] = (sum(all_table['pupil'] == 'R'), 'Number of frames from GRISMR')
     primary_hd["N_C"] = (sum(all_table['pupil'] == 'C'), 'Number of frames from GRISMC')
     hdu = fits.PrimaryHDU(header = primary_hd)
@@ -792,6 +941,7 @@ def extract_2d_spec_worker(
     hdu_sci.header['wave_1'] = (wave_sample_c[0], 'Wavelength (um) of first pixel')
     hdu_sci.header['d_wave'] = (wave_sample_c[1] - wave_sample_c[0], 'Wavelength Difference (um) between each pixel')
     hdu_sci.header['comments'] = ('wave = wave_1 + np.arange(0, NAXIS1, 1) * d_wave')
+    hdu_sci.header["BUNIT"] = (bunit, 'Brightness Unit')
     # weight extension
     hdu_wht = fits.ImageHDU(all_wht_2d, name = 'WHT2D')
     hdu_wht.header['comments'] = ('Weight image; ERR = WHT^(-0.5)')
@@ -803,6 +953,7 @@ def extract_2d_spec_worker(
     hdu_line.data = all_line_2d
     hdu_line.header['extname'] = 'LINE2D'
     hdu_line.header['comments'] = ('Line-only image extracted on continuum-filtered 2D data')
+    hdu_line.header['BUNIT'] = (bunit, 'Brightness Unit')
     # statistics tab
     hdu_tab = fits.BinTableHDU(all_table, name = 'STATS')
     hdu_tab.header['COMMENT'] = 'name:     name of simulated image'
@@ -825,7 +976,7 @@ def extract_2d_spec_worker(
 
 
 # ---------------------------------------------------------------------------
-# Direct-image cutout helpers and 1-D spectral extraction
+# Image cutout helpers and 1-D spectral extraction
 # ---------------------------------------------------------------------------
 
 def _get_mosaic_cutout(
@@ -902,7 +1053,9 @@ def _query_jades_cutout(
     Fetch a 2D postage-stamp cutout from a JADES HLSP mosaic on MAST.
 
     Uses ``astrocut.FITSCutout`` with a MAST cloud URI to stream only the
-    required pixels — no full-mosaic download needed.
+    required pixels — no full-mosaic download needed.  This is an optional
+    streaming alternative to :func:`_get_mosaic_cutout`; the 1D extraction
+    worker currently uses :func:`_get_mosaic_cutout` instead.
 
     Parameters
     ----------
@@ -912,14 +1065,14 @@ def _query_jades_cutout(
         NIRCam filter name, e.g. ``'F444W'``.
     size_arcsec : float
         Side length of the square cutout in arcseconds.
-    target: str
-        Target name of the field, e.g. goods-s or goods-n
     jades_field : str
         JADES field name, e.g. ``'goods-s-deep'`` or ``'goods-n'``.
     jades_dr : str
         JADES data release tag, e.g. ``'dr1'``, ``'dr2'``, ``'dr3'``.
-    version: str
-        JADES mosaic version tag, e.g. ``'v1.0'``, ``v2.0``. 
+    version : str
+        JADES mosaic version tag, e.g. ``'v1.0'``, ``'v2.0'``.
+    target : str
+        Target name of the field, e.g. ``'goods-s'`` or ``'goods-n'``.
 
     Returns
     -------
@@ -978,7 +1131,7 @@ def extract_1d_spec_worker(
     Extract a 1D spectrum from a co-added 2D grism spectrum FITS file.
 
     Loads the 2D co-add, estimates an optimal spatial (cross-dispersion) profile
-    from a direct-image cutout read from a local mosaic FITS file on disk,
+    from an image cutout read from a local mosaic FITS file on disk,
     performs optimal and/or boxcar extraction to produce a 1D spectrum, and
     saves a diagnostic plot (PDF) and the 1D spectrum table (FITS) alongside
     the input file.
@@ -986,11 +1139,14 @@ def extract_1d_spec_worker(
     Parameters
     ----------
     spec2d_path : str
-        Path to the co-added 2D spectrum FITS file.
+        Path to the co-added 2D spectrum FITS file, including all coadds.
     extraction_dir : str
-        Directory to save the extracted 1D spectrum and diagnostic plot.
+        Directory to save the extracted 1D spectrum.
     do_boxcar : bool
         If True, skip optimal extraction and use boxcar only.
+    grism_conf : GrismConf
+        Grism configuration object containing dispersion and sensitivity
+        calibration, used to convert pixel columns to wavelengths.
     image_mosaic_dir : str
         Directory containing the large JWST mosaic FITS files on disk.
     image_mosaic_filename_fmt : str
@@ -1002,6 +1158,9 @@ def extract_1d_spec_worker(
     image_mosaic_field : str
         Field identifier inserted into *image_mosaic_filename_fmt*
         (e.g. ``'goods-s'`` or ``'goods-n'``).
+    plot_dir : str or None
+        Directory for saving the diagnostic PDF plot.  If ``None``, the plot
+        is saved alongside the input ``spec2d_path`` file.
     """
     if image_mosaic_rgb_bands is None:
         image_mosaic_rgb_bands = ['F090W', 'F200W', 'F444W']
@@ -1042,7 +1201,7 @@ def extract_1d_spec_worker(
     RA, DEC = spec2d_fits[0].header['RA0'], spec2d_fits[0].header['DEC0']
     coord   = SkyCoord(RA, DEC, unit=(u.deg, u.deg))
 
-    # --- Spatial profile estimation from direct-image cutout ---
+    # --- Spatial profile estimation from image cutout ---
     # NOTE: A and B are in arcsec (JADES DR5), PA in degrees (N→E); we rotate PA
     # to be relative to the dispersion direction using obs_pa (V3 PA).
     profile_name    = 'none'
@@ -1133,6 +1292,7 @@ def extract_1d_spec_worker(
     is_cont = source_mag < cont_mag_limit
 
     # --- Load 2D spectral arrays ---
+    bunit = spec2d_fits['spec2d'].header.get('BUNIT')
     spec2d = spec2d_fits['spec2d'].data
     line2d = spec2d_fits['line2d'].data
     wht2d  = spec2d_fits['wht2d'].data
@@ -1142,7 +1302,12 @@ def extract_1d_spec_worker(
     # --- Re-estimate continuum via median filtering; keep if it reduces noise ---
     line2d_orig   = line2d.copy()
     highSN_mask   = line2d_orig / wht2d ** -0.5 > 2.0
-    spec2d_counts = spec2d * grism_conf.get_sensitivity("A", "R")(wave)
+    if bunit == "mJy":
+        spec2d_counts = spec2d * (grism_conf.get_sensitivity("A", "R")(wave) * 1e-3)
+    elif bunit == "DN/s":
+        spec2d_counts = spec2d.copy()
+    else:
+        raise ValueError('Unrecognized BUNIT %s in spec2d header' % bunit)
     valid_cols    = np.where(np.sum(np.isnan(spec2d_counts), axis=0) != len(spec2d_counts))[0]
 
     spec2d_counts_medflt = spec2d_counts.copy()
@@ -1154,7 +1319,10 @@ def extract_1d_spec_worker(
     spec2d_counts_medflt_narrow[:, valid_cols] = ndimage.median_filter(
         spec2d_counts[:, valid_cols], footprint=np.ones((1, 50)), mode='reflect'
     )
-    line2d_new = spec2d - np.nan_to_num(spec2d_counts_medflt_narrow / grism_conf.get_sensitivity("A", "R")(wave))
+    if bunit == "mJy":
+        line2d_new = spec2d - np.nan_to_num(spec2d_counts_medflt_narrow / (grism_conf.get_sensitivity("A", "R")(wave) * 1e-3))
+    else:
+        line2d_new = spec2d - np.nan_to_num(spec2d_counts_medflt_narrow)
     if sigma_clipped_stats(line2d_new, sigma=2)[2] <= sigma_clipped_stats(line2d_orig, sigma=2)[2]:
         line2d = line2d_new
 
@@ -1269,7 +1437,7 @@ def extract_1d_spec_worker(
         ymax_1d = np.nanpercentile(spec1d[np.isfinite(spec1d) & (spec1d != 0)], 95) * 1.5
     ax[2].axhline(0, color='grey', ls='--')
     ax[2].set(xlim=(wave_range[0] + 0.05, wave_range[1] - 0.05), xticks=xticks,
-              xlabel='Observed Wavelength (µm)', ylabel='Flux Density [mJy]')
+              xlabel='Observed Wavelength (µm)', ylabel='Flux Density [{}]'.format(bunit))
     ax[2].set_ylim(np.clip(vmin_li * 2.0, -0.035, 0), np.clip(ymax_1d, 0.015, 1e8))
 
     # Annotations
@@ -1291,8 +1459,8 @@ def extract_1d_spec_worker(
                 fontsize=15, color='r', edge=5e-3, path_effects=[pe.withStroke(linewidth=2.5, foreground='w')])
 
     # Redshift and emission-line markers
-    if 'z_spec' in spec2d_fits[0].header:
-        z = spec2d_fits[0].header['z_spec']
+    if 'z_grism' in spec2d_fits[0].header:
+        z = spec2d_fits[0].header['z_grism']
         corner_text(ax[2], loc=4, s='z=%.3f' % z, color='r', fontsize=15, edge=5e-3, zorder=999,
                     path_effects=[pe.withStroke(linewidth=2.5, foreground='w')])
         kw_vline = dict(ymin=0., ymax=1., zorder=-5, lw=5, alpha=0.5, color='skyblue')
@@ -1474,6 +1642,11 @@ def store_all_2d_emline(
         Filter, observed wavelength (µm), and name of the targeted emission line.
     overwrite:
         Overwrite the output file if it exists.
+
+    Returns
+    -------
+    hdul : fits.HDUList
+        The assembled ``HDUList`` (also written to disk when ``overwrite=True``).
     """
     hdul = fits.HDUList([fits.PrimaryHDU()])
     hdul[0].header["RA0"]      = (float(coord.ra.deg),   "Source RA (deg)")
@@ -1510,9 +1683,12 @@ def store_all_2d_emline(
         h_sci = fits.ImageHDU(sci.astype(np.float32), name="SCI-%d" % i)
         h_sci.header["XS"]       = (float(xs_list[i]),    "X position in grism frame (pix)")
         h_sci.header["YS"]       = (float(ys_list[i]),    "Y position in grism frame (pix)")
-        h_sci.header["DISPANG"]    = (float(np.rad2deg(theta_list[i])), "Dispersion angle (deg)")
+        h_sci.header["DISPANG"]    = (float(np.rad2deg(theta_list[i])), 
+                                      "Dispersion angle w.r.t the cutout X axis (deg, CCW from +X)")
         h_sci.header["MODULE"]   = modules[i]
         h_sci.header["PUPIL"]    = pupils[i]
+        h_sci.header["FRAME_PA"] = (float(0.0), 
+                                    "Position angle of the cutout X axis (northward from west)")
         h_sci.header["DATAPATH"] = os.path.basename(paths[i])
         h_sci.header["EFFEXPTM"] = (float(effexptm_list[i]), "Effective exposure time (s)")
         h_sci.header["GS_V3_PA"] = (float(gs_v3pa_list[i]),  "V3 position angle (deg)")
@@ -1545,8 +1721,8 @@ def store_all_2d_emline(
 
 def _compute_grism_psf_frame(
     primary_hd: fits.Header,
-    x0: float,
-    y0: float,
+    xs: float,
+    ys: float,
     filter_name: str,
     oversample: int = 4,
     fov_pixels: int = 51,
@@ -1573,8 +1749,9 @@ def _compute_grism_psf_frame(
         Primary FITS header of the grism level-1.5 file.  Must contain at
         least ``MODULE`` (``'A'`` or ``'B'``).  ``DETECTOR``, ``DATE-BEG``,
         and ``GS_V3_PA`` are used when available.
-    x0, y0:
-        Source pixel position in the grism detector frame (0-indexed).
+    xs, ys:
+        Predicted pixel position of the emission line in the grism detector
+        frame (0-indexed).
     filter_name:
         NIRCam LW filter, e.g. ``'F444W'``.
     oversample:
@@ -1594,18 +1771,11 @@ def _compute_grism_psf_frame(
     stpsf_version : str
         ``stpsf.__version__`` string, or ``'gaussian_fallback'``.
     """
-    # Map FITS DETECTOR keyword → stpsf detector name
-    _DET_MAP = {
-        "NRCALONG": "NRCA5", "NRCA5": "NRCA5",
-        "NRCA1": "NRCA1", "NRCA2": "NRCA2", "NRCA3": "NRCA3", "NRCA4": "NRCA4",
-        "NRCBLONG": "NRCB5", "NRCB5": "NRCB5",
-        "NRCB1": "NRCB1", "NRCB2": "NRCB2", "NRCB3": "NRCB3", "NRCB4": "NRCB4",
-    }
     module   = primary_hd.get("MODULE", "A")
-    det_raw  = primary_hd.get("DETECTOR", "NRC%sLONG" % module).upper()
-    det_name = _DET_MAP.get(det_raw, "NRC%s5" % module)
+    det_name = primary_hd.get("DET_NAME", "NRC%s5" % module)
     date_obs = primary_hd.get("DATE-BEG", primary_hd.get("DATE-OBS", None))
-
+    assert (xs >= VALID_X_LEFT) and (xs <= VALID_X_RIGHT) and (ys >= VALID_Y_BOTTOM) and (ys <= VALID_Y_TOP), \
+         "Source position (%.1f, %.1f) is too close to the detector edge for reliable PSF computation" % (xs, ys)
     try:
         import stpsf
         stpsf_ver = stpsf.__version__
@@ -1617,7 +1787,7 @@ def _compute_grism_psf_frame(
             nc = stpsf.NIRCam()
             nc.filter          = filter_name
             nc.detector        = det_name
-            nc.detector_position = (float(x0), float(y0))
+            nc.detector_position = (float(xs), float(ys))
             # Use imaging (CLEAR) pupil — grism element does not change spatial PSF
             nc.pupil_mask      = None
 
@@ -1629,6 +1799,7 @@ def _compute_grism_psf_frame(
                     pass  # fall back to default OPD already set on nc
 
             psf_hdul  = nc.calc_psf(
+                #monochromatic=?,
                 oversample=oversample,
                 fov_pixels=fov_pixels,
                 normalize="last",
@@ -1650,18 +1821,462 @@ def _compute_grism_psf_frame(
     wave_um = _FILTER_WAVE.get(filter_name, 4.0)
     # Diffraction-limited FWHM in arcsec, converted to native pix
     fwhm_arcsec = 1.22 * wave_um * 1e-6 / 6.5 * (180 / np.pi) * 3600
-    fwhm_pix    = fwhm_arcsec / NIRCAM_LW_PIXSCALE          # native pixels
-    sigma_over  = fwhm_pix / (2.0 * np.sqrt(2.0 * np.log(2.0)))   # native σ
+    fwhm_pix    = fwhm_arcsec / (NIRCAM_LW_PIXSCALE * oversample) # supersampled pixels
+    sigma_over  = fwhm_pix / (2.0 * np.sqrt(2.0 * np.log(2.0)))   # supersampled σ
 
-    N_over = fov_pixels  # Gaussian fallback is at native scale (oversample=1)
+    N_over = fov_pixels * oversample  # Gaussian fallback is at super-sampled scale
     y_g, x_g = np.mgrid[0:N_over, 0:N_over]
     c = (N_over - 1) / 2.0
     psf_arr = np.exp(-((x_g - c) ** 2 + (y_g - c) ** 2) / (2.0 * sigma_over ** 2))
     psf_arr /= psf_arr.sum()
-    return psf_arr, 1, "gaussian_fallback"
+    return psf_arr, oversample, "gaussian_fallback"
 
 
-def extract_2d_emline_worker(
+# ---------------------------------------------------------------------------
+# Helpers for extract_2d_emline_worker_drizzle
+# ---------------------------------------------------------------------------
+
+def _make_sky_wcs(ra, dec, pixscale_arcsec, n_pix):
+    """Sky-aligned TAN WCS centred at (ra, dec); +X = west, +Y = north."""
+    wcs_header = fits.Header(
+        {"NAXIS": 2, 
+        "NAXIS1": n_pix, 
+        "NAXIS2": n_pix,
+        "WCSAXES": 2,
+        "CRPIX1": n_pix / 2.0 + 1.0,
+        "CRPIX2": n_pix / 2.0 + 1.0,
+        "CRVAL1": ra,
+        "CRVAL2": dec,
+        "CTYPE1": 'RA---TAN-SIP',
+        "CTYPE2": 'DEC--TAN-SIP',
+        "CUNIT1": 'deg',
+        "CUNIT2": 'deg',
+        "CD1_1": -pixscale_arcsec / 3600.0,
+        "CD1_2": 0.0,
+        "CD2_1": 0.0,
+        "CD2_2": pixscale_arcsec / 3600.0}
+    )
+    wcs = WCS(wcs_header)
+    return wcs, wcs.to_header()
+
+
+def _build_cutout_and_pixmap(image, emline, weight, data_quality,
+                              x0, y0, xs, ys, cutout_size, wcs_di, out_wcs):
+    """
+    Take a padded cutout centred at (xs, ys) and build the drizzle pixel map.
+
+    The cutout is padded to ``ceil(cutout_size * sqrt(2) / 2) + 1`` half-width
+    so that the sky-aligned output square is always fully covered at any roll angle.
+
+    Returns a dict with keys
+        cutout_sci, cutout_line, cutout_wht, cutout_dq,
+        cutout_wht_drz, pixmap, pad_size, pad_half
+    or None if the cutout falls outside the image boundary.
+    """
+    pad_half = int(np.ceil(cutout_size * np.sqrt(2) / 2)) + 1
+    pad_size = 2 * pad_half + 1
+    # cut window around the targeted emission line
+    ny, nx = image.shape
+    xs_int = int(np.round(xs))
+    ys_int = int(np.round(ys))
+    x_lo = xs_int - pad_half
+    y_lo = ys_int - pad_half
+    x_hi = xs_int + pad_half + 1
+    y_hi = ys_int + pad_half + 1
+
+    if x_lo < 0 or x_hi > nx or y_lo < 0 or y_hi > ny:
+        return None
+
+    cutout_sci  = image       [y_lo:y_hi, x_lo:x_hi].copy()
+    cutout_line = emline      [y_lo:y_hi, x_lo:x_hi].copy()
+    cutout_wht  = weight      [y_lo:y_hi, x_lo:x_hi].copy()
+    cutout_dq   = data_quality[y_lo:y_hi, x_lo:x_hi].copy()
+
+    cutout_wht_drz = np.nan_to_num(cutout_wht, nan=0.0, posinf=0.0, neginf=0.0)
+    cutout_wht_drz[cutout_dq % 2 == 1] = 0.0
+
+    # Build pixel map: each padded cutout pixel (ix, iy) maps to sky via the
+    # *undispersed* position (x0 + offset, y0 + offset), eliminating sub-pixel
+    # rounding error in xs_int = round(x0 + dx_line).
+    iy_arr, ix_arr = np.mgrid[0:pad_size, 0:pad_size]
+    gx_undis = (x0 + (ix_arr - pad_half)).ravel()
+    gy_undis = (y0 + (iy_arr - pad_half)).ravel()
+    # map the cutout pixel grid to sky coordinates at direct image position (x0, y0)
+    sky_coords = wcs_di.all_pix2world(np.column_stack([gx_undis, gy_undis]), 0)
+    # map the sky coordinates at direct image to output pixel coordinates
+    out_pix    = out_wcs.all_world2pix(sky_coords, 0)
+    pixmap = np.dstack([
+        out_pix[:, 0].reshape(pad_size, pad_size),
+        out_pix[:, 1].reshape(pad_size, pad_size),
+    ])
+
+    return dict(
+        cutout_sci=cutout_sci, cutout_line=cutout_line,
+        cutout_wht=cutout_wht, cutout_dq=cutout_dq,
+        cutout_wht_drz=cutout_wht_drz, pixmap=pixmap,
+        pad_size=pad_size, pad_half=pad_half,
+    )
+
+
+def _process_emline_frame(grism_fn, POM_fn, source_id, wave_line_obs,
+                           grism_conf, filter, out_wcs, cutout_size,
+                           psf_oversample, drz_psf, psf_meta, pixfrac, pixscale_ratio):
+    """
+    Drizzle helper for :func:`extract_2d_emline_worker_drizzle`.
+
+    For a single grism frame, this function:
+
+    1. Reads the POM catalog to get the undispersed source position ``(x0, y0)``.
+    2. Loads the grism SCI, emline, DQ, and weight arrays.
+    3. Calls ``get_position_ang_dispang_at_wave`` to obtain the predicted emission-line
+       pixel position ``(xs, ys)`` and local dispersion angle ``theta`` in the
+       sky-aligned output frame.
+    4. Calls :func:`_build_cutout_and_pixmap` to produce a padded cutout and pixel map.
+    5. Drizzles the SCI and LINE cutouts separately onto a ``cutout_size × cutout_size``
+       sky-aligned output grid.
+    6. Calls :func:`_compute_grism_psf_frame` and drizzles the resulting PSF into the
+       shared ``drz_psf[mp_key]`` accumulator.
+
+    Mutates ``drz_psf`` and ``psf_meta`` in place (PSF accumulation across frames).
+    Returns ``None`` if the frame should be skipped (filter mismatch, source absent
+    in POM catalog, or predicted position out of bounds).
+
+    Returns
+    -------
+    result : dict or None
+        Keys: ``cutout, xs, ys, theta, module, pupil, path, effexptm, gs_v3pa,
+        mp_key, frame_sci, frame_line, frame_wht``.
+        ``cutout`` is a tuple ``(sci, line, wht, dq)`` of 2-D arrays from the
+        un-drizzled padded cutout.  ``frame_sci``, ``frame_line``, and ``frame_wht``
+        are the drizzled outputs on the sky-aligned grid.
+    """
+    POM_cat    = ascii.read(POM_fn)
+    primary_hd = fits.getheader(grism_fn)
+    sci_hd     = fits.getheader(grism_fn, "sci")
+    wcs_grism = WCS(sci_hd)
+
+    _filter = primary_hd["FILTER"]
+    module  = primary_hd["MODULE"]
+    pupil   = primary_hd["PUPIL"][-1]
+
+    if _filter != filter:
+        return None
+
+    image = fits.getdata(grism_fn, "sci")
+    try:
+        emline = fits.getdata(grism_fn, "emline")
+    except KeyError:
+        emline = image
+    data_quality = fits.getdata(grism_fn, "dq")
+
+    weight_path = grism_fn.replace("lv1.5.fits", "wht.fits")
+    if os.path.isfile(weight_path):
+        weight = fits.getdata(weight_path)
+    else:
+        weight = fits.getdata(grism_fn, "err")
+        weight[weight == 0] = np.nan
+        weight = weight ** -2
+
+    item_POM = POM_cat[POM_cat["Index"] == source_id]
+    if len(item_POM) == 0:
+        return None
+    x0 = float(item_POM["pixel_x"][0])
+    y0 = float(item_POM["pixel_y"][0])
+
+    ### Load dispersion solutions
+    xs, ys, theta = get_position_ang_dispang_at_wave(
+        x0, y0, wave_line_obs, grism_conf, module, pupil, 
+        wcs_transform=[wcs_grism, out_wcs], velosys=sci_hd["velosys"])
+    if (xs < VALID_X_LEFT) or (xs > VALID_X_RIGHT) or (ys < VALID_Y_BOTTOM) or (ys > VALID_Y_TOP):
+        print(" >> [emline] ID%s %s%s predicted position (%.1f,%.1f) out of bounds; skip" %
+              (source_id, module, pupil, xs, ys))
+        return None
+
+    ### Take cutout of emission line at the predicted position in grism image.
+    cutout_result = _build_cutout_and_pixmap(
+        image, emline, weight, data_quality,
+        x0, y0, xs, ys, cutout_size * 1.5, wcs_grism, out_wcs,
+    )
+    if cutout_result is None:
+        print(" >> [emline] ID%s %s%s cutout out of bounds at (%.1f,%.1f); skip" %
+              (source_id, module, pupil, xs, ys))
+        return None
+
+    cutout_sci     = cutout_result['cutout_sci']
+    cutout_line_   = cutout_result['cutout_line']
+    cutout_wht     = cutout_result['cutout_wht']
+    cutout_dq      = cutout_result['cutout_dq']
+    cutout_wht_drz = cutout_result['cutout_wht_drz']
+    pixmap         = cutout_result['pixmap']
+    pad_size       = cutout_result['pad_size']
+
+    mp_key   = "%s%s" % (module, pupil)
+    effexptm = max(float(primary_hd.get("EFFEXPTM", 1.0)), 1e-6)
+    gs_v3pa  = float(np.deg2rad(primary_hd.get("GS_V3_PA", np.nan)))
+
+    if mp_key not in drz_psf:
+        drz_psf[mp_key] = Drizzle(kernel="square", 
+            out_shape=(cutout_size*psf_oversample, cutout_size*psf_oversample))
+    out_wcs_psf = out_wcs.deepcopy()
+    out_wcs_psf.wcs.cd = out_wcs_psf.wcs.cd / psf_oversample
+    out_wcs_psf.array_shape = [out_wcs_psf.array_shape[0] * psf_oversample,
+                                out_wcs_psf.array_shape[1] * psf_oversample]
+    out_wcs_psf.wcs.set()
+
+    drz_f_sci  = Drizzle(kernel="square", out_shape=(cutout_size, cutout_size))
+    drz_f_line = Drizzle(kernel="square", out_shape=(cutout_size, cutout_size))
+    drz_f_sci.add_image(
+        cutout_sci.astype(np.float64), exptime=effexptm,
+        pixmap=pixmap, weight_map=cutout_wht_drz.astype(np.float64),
+        pixfrac=pixfrac, in_units="cps", scale=pixscale_ratio
+    )
+    drz_f_line.add_image(
+        cutout_line_.astype(np.float64), exptime=effexptm,
+        pixmap=pixmap, weight_map=cutout_wht_drz.astype(np.float64),
+        pixfrac=pixfrac, in_units="cps", scale=pixscale_ratio
+    )
+    frame_sci  = drz_f_sci.out_img.copy()
+    frame_line = drz_f_line.out_img.copy()
+    frame_wht  = drz_f_sci.out_wht.copy()
+    frame_sci [frame_wht == 0] = np.nan
+    frame_line[frame_wht == 0] = np.nan
+
+    # PSF model for this frame — drizzled into the shared accumulator
+    psf_frame, psf_over_used, psf_ver = _compute_grism_psf_frame(
+        primary_hd=primary_hd, xs=xs, ys=ys,
+        filter_name=filter, oversample=psf_oversample, fov_pixels=pad_size,
+    )
+    if mp_key not in psf_meta:
+        psf_meta[mp_key] = (psf_ver, psf_over_used)
+
+    N_psf_over  = psf_frame.shape[0]
+    iy_p, ix_p  = np.mgrid[0:N_psf_over, 0:N_psf_over]
+    center_over = (N_psf_over - 1) / 2.0
+    gx_psf = (x0 + (ix_p - center_over) / psf_over_used).ravel()
+    gy_psf = (y0 + (iy_p - center_over) / psf_over_used).ravel()
+
+    sky_psf  = wcs_grism.all_pix2world(np.column_stack([gx_psf, gy_psf]), 0)
+    opix_psf = out_wcs_psf.all_world2pix(sky_psf, 0)
+    pixmap_psf = np.dstack([
+        opix_psf[:, 0].reshape(N_psf_over, N_psf_over),
+        opix_psf[:, 1].reshape(N_psf_over, N_psf_over),
+    ])
+    drz_psf[mp_key].add_image(
+        psf_frame.astype(np.float64), exptime=effexptm,
+        pixmap=pixmap_psf, weight_map=np.ones_like(psf_frame, dtype=np.float64),
+        pixfrac=pixfrac, in_units="cps", scale=pixscale_ratio
+    )
+
+    return dict(
+        cutout=(cutout_sci, cutout_line_, cutout_wht, cutout_dq),
+        xs=xs, ys=ys, theta=theta,
+        module=module, pupil=pupil, path=grism_fn,
+        effexptm=float(primary_hd.get("EFFEXPTM", np.nan)),
+        gs_v3pa=gs_v3pa, mp_key=mp_key,
+        frame_sci=frame_sci, frame_line=frame_line, frame_wht=frame_wht,
+    )
+
+
+def _sigma_clip_weighted_coadd(frame_list_sci, frame_list_line, frame_list_wht):
+    """
+    Sigma-clip (σ=2.5, 5 iters) across frames then compute inverse-variance
+    weighted mean.  Returns (coadd_sci, coadd_line, coadd_wht, coadd_cov).
+    """
+    arr_sci  = np.array(frame_list_sci,  dtype=np.float64)
+    arr_line = np.array(frame_list_line, dtype=np.float64)
+    arr_wht  = np.array(frame_list_wht,  dtype=np.float64)
+
+    if arr_sci.shape[0] > 2:
+        sc = SigmaClip(sigma=2.5, maxiters=5)
+        arr_sci  = sc(arr_sci,  axis=0, masked=False)
+        arr_line = sc(arr_line, axis=0, masked=False)
+
+    arr_wht[np.isnan(arr_sci)]  = 0.0
+    arr_wht[np.isnan(arr_line)] = 0.0
+
+    wht_sum    = np.nansum(arr_wht, axis=0)
+    coadd_sci  = np.where(wht_sum > 0,
+                          np.nansum(arr_sci  * arr_wht, axis=0) / wht_sum, np.nan)
+    coadd_line = np.where(wht_sum > 0,
+                          np.nansum(arr_line * arr_wht, axis=0) / wht_sum, np.nan)
+    coadd_wht  = wht_sum
+    coadd_cov  = np.int8(np.sum(arr_wht > 0, axis=0))
+    return coadd_sci, coadd_line, coadd_wht, coadd_cov
+
+
+def _build_emline_coadd_hdul(
+    source_id, source_ra, source_dec,
+    filter_name, module_mp, pupil_mp,
+    name_line, wave_line_obs, eml_snr, z_grism,
+    pixscale_out,
+    coadd_sci, coadd_line, coadd_wht, coadd_cov,
+    coadd_psf,
+    n_coadd, mean_theta, diff_theta, mean_effexptm, mean_gs_v3pa,
+    frame_pa=0.0,
+    out_wcs_header=None,
+    psf_meta_mp=None,
+    wave_1=None,
+    d_wave=None,
+    cutout_size=None,
+    chiral=None,
+):
+    """Build the output HDUList for one module-pupil emission-line coadd.
+
+    All angle parameters (mean_theta, diff_theta, mean_gs_v3pa, frame_pa) must
+    be in radians; they are stored as-is in FITS headers with unit comment "(rad)".
+
+    Returns an ``HDUList`` with extensions:
+    ``PRIMARY``, ``SPEC2D``, ``WHT2D``, ``COV2D``, ``LINE2D``, ``PSF2D``.
+
+    Parameters
+    ----------
+    source_id : int or str
+        Source identifier written to the ``ID`` header keyword.
+    source_ra, source_dec : float
+        Source sky position in degrees.
+    filter_name : str
+        Grism filter name (e.g. ``'F444W'``).
+    module_mp, pupil_mp : str
+        Detector module (``'A'`` or ``'B'``) and pupil (``'R'`` or ``'C'``).
+    name_line : str
+        Name of the targeted emission line (e.g. ``'Ha'``).
+    wave_line_obs : float
+        Observed wavelength of the emission line in µm.
+    eml_snr : float
+        Best-fit S/N of the line across all frames.
+    z_grism : float
+        Spectroscopic redshift from the grism.
+    pixscale_out : float
+        Output pixel scale in arcsec/pixel.
+    coadd_sci, coadd_line : 2-D ndarray
+        Co-added SCI and continuum-subtracted LINE images.
+    coadd_wht : 2-D ndarray
+        Co-added inverse-variance weight map.
+    coadd_cov : 2-D ndarray
+        Integer coverage map (number of frames covering each pixel).
+    coadd_psf : 2-D ndarray
+        Co-added (and normalised) PSF model image.
+    n_coadd : int
+        Number of frames included in the coadd.
+    mean_theta : float
+        Mean dispersion angle w.r.t. the cutout +X axis (rad, CCW from +X).
+    diff_theta : float
+        Frame-to-frame variation of the dispersion angle (rad).
+    mean_effexptm : float
+        Total effective exposure time (s).
+    mean_gs_v3pa : float
+        Mean V3 position angle across frames (rad).
+    frame_pa : float, optional
+        Position angle of the cutout +X axis (northward from west, rad).
+        Default is 0.0 (sky-aligned drizzle case).
+    out_wcs_header : dict or None
+        Sky-aligned WCS key-value pairs (drizzle case); ``None`` for simple coadd.
+    psf_meta_mp : (str, int) or None
+        ``(version_string, oversample)`` tuple used to populate PSF extension
+        headers.
+    wave_1 : float or None
+        Wavelength of the first cutout pixel in µm (simple case only).
+    d_wave : float or None
+        Wavelength step in µm/pix (simple case only).
+    cutout_size : int or None
+        Side length of the cutout in pixels; stored as ``APERTURE`` (simple case only).
+    chiral : int or None
+        Chirality convention: +1 right-handed, -1 left-handed (simple case only).
+    """
+    # --- Primary HDU ---------------------------------------------------------
+    hdu = fits.PrimaryHDU()
+    hdu.header["ID"]       = (source_id,     "Source ID")
+    hdu.header["RA0"]      = (source_ra,     "Source RA (deg)")
+    hdu.header["DEC0"]     = (source_dec,    "Source DEC (deg)")
+    hdu.header["FILTER"]   = (filter_name,   "Filter name")
+    hdu.header["MODULE"]   = (module_mp,     "Detector module (A or B)")
+    hdu.header["PUPIL"]    = (pupil_mp,      "Pupil (R=GRISMR, C=GRISMC)")
+    hdu.header["LINENAME"] = (name_line,     "Target emission line")
+    hdu.header["LINEWAVE"] = (wave_line_obs, "Observed wavelength of line (um)")
+    hdu.header["LINESNR"]  = (eml_snr,       "Bestfit S/N of the line from all frames")
+    hdu.header["ZGRISM"]   = (z_grism,       "Spectroscopic redshift from grism")
+    hdu.header["N_COADD"]  = (n_coadd,       "Number of coadded frames")
+    hdu.header["DISPANG"]  = (mean_theta,
+                              "Mean dispersion angle w.r.t. the cutout X axis (rad, CCW from +X)")
+    hdu.header["DISPANGW"] = (diff_theta,
+                              "Dispersion angle variation among frames (rad)")
+    hdu.header["FRAME_PA"] = (frame_pa,
+                              "Position angle of the cutout X axis (northward from west, rad)")
+    hdu.header["GS_V3_PA"] = (mean_gs_v3pa,
+                              "Mean V3 position angle (rad)")
+    hdu.header["EFFEXPTM"] = (mean_effexptm, "Total effective exposure time (s)")
+    hdu.header["PIXSCALE"] = (pixscale_out,  "Spatial pixel scale (arcsec/pix)")
+    if wave_1 is not None:
+        hdu.header["WAVE_1"] = (wave_1, "Wavelength of first cutout pixel (um)")
+    if d_wave is not None:
+        hdu.header["D_WAVE"] = (d_wave, "Wavelength step (um/pix)")
+    hdu.header["AUTHOR"]   = ("Jiachuan Xu", "Author")
+    hdu.header["TIME"]     = (
+        time.strftime("%Y/%m/%d %H:%M:%S", time.localtime()), "Creation time"
+    )
+    if out_wcs_header is not None:
+        for key, val in out_wcs_header.items():
+            hdu.header[key] = val
+
+    # --- Image extensions ----------------------------------------------------
+    frame_comment = ("+X = west (+RA), +Y = north (+DEC)" if out_wcs_header is not None
+                     else "+X = dispersion (+wavelength), +Y = cross-dispersion")
+
+    hdu_sci  = fits.ImageHDU(coadd_sci.astype(np.float32),  name="SPEC2D")
+    hdu_wht  = fits.ImageHDU(coadd_wht.astype(np.float32),  name="WHT2D")
+    hdu_cov  = fits.ImageHDU(coadd_cov.astype(np.int8),     name="COV2D")
+    hdu_line = fits.ImageHDU(coadd_line.astype(np.float32), name="LINE2D")
+
+    for _hdu in [hdu_sci, hdu_line]:
+        _hdu.header["BUNIT"]    = ("DN/s", "Brightness unit (no sensitivity correction)")
+        _hdu.header["COMMENT"]  = frame_comment
+        _hdu.header["PIXSCALE"] = (pixscale_out, "Spatial pixel scale (arcsec/pix)")
+        _hdu.header["DISPANG"]  = (float(mean_theta),
+                                   "Mean dispersion angle w.r.t. the cutout X axis (rad, CCW from +X)")
+        _hdu.header["DISPANGW"] = (float(diff_theta),
+                                   "Dispersion angle variation among frames (rad)")
+        _hdu.header["FRAME_PA"] = (float(frame_pa),
+                                   "Position angle of the cutout X axis (northward from west, rad)")
+        _hdu.header["EMLFITSN"] = (eml_snr, "Bestfit S/N of the line from all frames")
+        _hdu.header["EMISSION"] = (name_line, "Target emission line")
+        if cutout_size is not None:
+            _hdu.header["APERTURE"] = (cutout_size, "Cutout size (pixels)")
+        if wave_1 is not None:
+            _hdu.header["WAVE_1"] = (wave_1, "Wavelength of first cutout pixel (um)")
+        if d_wave is not None:
+            _hdu.header["D_WAVE"] = (d_wave, "Wavelength step (um/pix)")
+        if chiral is not None:
+            _hdu.header["CHIRAL"] = (chiral, "Chirality: +1 right-handed, -1 left-handed")
+
+    # --- PSF extension -------------------------------------------------------
+    _psf_ver, _psf_over = psf_meta_mp if psf_meta_mp is not None else ("unknown", 1)
+    hdu_psf = fits.ImageHDU(coadd_psf.astype(np.float32), name="PSF2D")
+    hdu_psf.header["BUNIT"]    = ("",           "Normalised PSF (sums to 1)")
+    hdu_psf.header["COMMENT"]  = frame_comment
+    hdu_psf.header["NAXIS"]  = 2
+    hdu_psf.header["NAXIS1"] = int(coadd_psf.shape[1])
+    hdu_psf.header["NAXIS2"] = int(coadd_psf.shape[0])
+    hdu_psf.header["MODULE"] = (module_mp,     "Detector module (A or B)")
+    hdu_psf.header["WAVELEN"] = (wave_line_obs*1e-6, "Wavelength at which PSF is computed (m)")
+    hdu_psf.header["CHANNEL"] = ("Long",   "Detector channel (Short or Long)")
+    hdu_psf.header["PILIN"] = False
+    hdu_psf.header["FILTER"] = (filter_name,  "Filter used for PSF calculation")
+    hdu_psf.header["PIXELSCL"] = (pixscale_out, "Output pixel scale (arcsec/pix)")
+    hdu_psf.header["OVERSAMP"] = (_psf_over,    "PSF super-sampling factor (native pix)")
+    hdu_psf.header["DET_SAMP"] = (_psf_over,    "PSF super-sampling factor (native pix)")
+    hdu_psf.header["DET_NAME"] = ("NRC%s5" % module_mp, "Detector name passed to stpsf")
+    hdu_psf.header["DIFFLMT"] = (1.22 * wave_line_obs*1e-6/6.5 * 206265,
+                                    "Diffraction limit FWHM (arcsec) at the line wavelength")
+    hdu_psf.header["FOV"] = (pixscale_out * coadd_psf.shape[0], "PSF field of view (arcsec)")
+    hdu_psf.header["N_COADD"] = (n_coadd,      "Number of PSF frames coadded")
+    if out_wcs_header is not None:
+        for key, val in out_wcs_header.items():
+            hdu_psf.header[key] = val
+
+    return fits.HDUList([hdu, hdu_sci, hdu_wht, hdu_cov, hdu_line, hdu_psf])
+
+
+def extract_2d_emline_worker_drizzle(
     grism_idx_per_source: list,
     POM_path_per_source: list,
     all_v1p5_list: list,
@@ -1670,6 +2285,8 @@ def extract_2d_emline_worker(
     filter: str,
     extraction_dir: str,
     cutout_size: int = 51,
+    cutout_pixscale: float = 0.031,
+    pixfrac: float = 1.0,
     psf_oversample: int = 4,
 ) -> None:
     """
@@ -1687,9 +2304,13 @@ def extract_2d_emline_worker(
     4. Maps each cutout pixel to the sky-aligned output frame by first removing
        the spectral offset (undispersed position), applying the grism WCS, and
        then reprojecting via the output WCS.
-    5. Accumulates per-frame cutouts with :func:`drizzle` into a common output
-       grid (pixel scale = NIRCAM_LW_PIXSCALE/2), separately for each
-       module-pupil combination.
+    5. Drizzles each per-frame cutout individually onto the output grid, then
+       sigma-clips (σ=2.5, 5 iterations) across frames at each output pixel
+       and computes an inverse-variance weighted mean, separately for each
+       module-pupil combination.  Output pixel scale =
+       ``cutout_pixscale`` arcsec/pix; output grid size =
+       ``cutout_size`` pixels
+       on a side; drop-size fraction = ``pixfrac``.
     6. Renders a super-sampled PSF model for each frame via
        :func:`_compute_grism_psf_frame` (using ``stpsf`` with in-flight OPD
        when available, falling back to a Gaussian approximation) and drizzles
@@ -1699,7 +2320,7 @@ def extract_2d_emline_worker(
     Results are saved as:
 
     * ``emline_2d_{filter}_ID{id}_{line}_all.fits``   – all per-frame cutouts.
-    * ``emline_2d_{filter}_ID{id}_{line}_{MP}coadd.fits`` – drizzled coadd
+    * ``emline_2d_{filter}_ID{id}_{line}_{MP}coadd_drz.fits`` – drizzled coadd
       per module-pupil (extensions: SPEC2D, WHT2D, COV2D, LINE2D, PSF2D).
 
     Parameters
@@ -1712,7 +2333,7 @@ def extract_2d_emline_worker(
         List of all level-1.5 grism FITS file paths.
     source_item:
         Single row from the source catalog; must contain ``ID``, ``RA``, ``DEC``,
-        ``z_spec``, ``fit_line_SN``, and ``name_line_exp`` columns.
+        ``z_grism``, ``fit_line_SN``, and ``name_line_exp`` columns.
     grism_conf:
         :class:`GrismConf` instance with dispersion and sensitivity calibration.
     filter:
@@ -1720,31 +2341,34 @@ def extract_2d_emline_worker(
     extraction_dir:
         Output directory for the drizzled FITS files.
     cutout_size:
-        Side length of the native-pixel cutout (must be odd for a symmetric
-        aperture; padded symmetrically).  The drizzled output is
-        ``2 × cutout_size`` pixels on a side at half the native pixel scale.
+        Side length of the drizzled output image in pixels.  Each per-frame
+        cutout is padded before drizzling; the final output grid is exactly
+        ``cutout_size × cutout_size`` pixels at ``cutout_pixscale`` arcsec/pixel.
+    cutout_pixscale:
+        Pixel scale of the drizzled output image in arcsec/pixel.
+    pixfrac:
+        Drizzle drop-shrunken scale factor (0 < pixfrac ≤ 1).
     psf_oversample:
         Super-sampling factor for the stpsf PSF model.  The PSF is rendered at
         ``psf_oversample × native_pixel_scale`` before being drizzled onto the
         output grid.  Higher values give a more accurate PSF at the cost of
         longer stpsf computation time.  Ignored in the Gaussian fallback, which
-        always produces a native-scale PSF.
+        always produces a native-scale PSF (oversample_used = 1).
     """
     if len(grism_idx_per_source) == 0:
         return
 
-    source_id  = source_item["ID"]
-    source_ra  = float(source_item["RA"])
-    source_dec = float(source_item["DEC"])
-    eml_snr   = float(source_item["fit_line_SN"])
+    source_id    = source_item["ID"]
+    source_ra    = float(source_item["RA"])
+    source_dec   = float(source_item["DEC"])
+    eml_snr      = float(source_item["fit_line_SN"])
     source_coord = SkyCoord(source_ra, source_dec, unit=(u.deg, u.deg))
 
-    # --- Emission line info ---------------------------------------------------
     try:
         name_line = str(source_item["name_line_exp"]).strip()
-        z_spec    = float(source_item["z_spec"])
+        z_grism   = float(source_item["z_grism"])
     except (KeyError, ValueError, TypeError) as exc:
-        print(" >> [emline] source %s: missing z_spec / name_line_exp (%s); skip" %
+        print(" >> [emline] source %s: missing z_grism / name_line_exp (%s); skip" %
               (source_id, exc))
         return
 
@@ -1753,36 +2377,21 @@ def extract_2d_emline_worker(
         return
 
     wave_line_rest = EML_LAB[name_line]
-    wave_line_obs  = wave_line_rest * (1.0 + z_spec)
+    wave_line_obs  = wave_line_rest * (1.0 + z_grism)
 
     if not (grism_conf.WRANGE[0] <= wave_line_obs <= grism_conf.WRANGE[1]):
         print(" >> [emline] source %s: line %.4f µm outside filter range; skip" %
               (source_id, wave_line_obs))
         return
 
-    # Safe filename tag (strip non-alphanumeric characters from line name)
     line_tag = "".join(c if c.isalnum() else "_" for c in name_line)
 
-    # --- Output WCS -----------------------------------------------------------
-    # Sky-aligned grid: +X = west (standard N-up E-left), +Y = north.
-    # Pixel scale = NIRCAM_LW_PIXSCALE / 2 arcsec/pix.
-    # Output array size = (2*cutout_size) × (2*cutout_size).
-    pixscale_out     = NIRCAM_LW_PIXSCALE / 2.0   # arcsec/pix
-    pixscale_out_deg = pixscale_out / 3600.0
-    N_out = 2 * cutout_size
+    # Output WCS: sky-aligned, +X=west, +Y=north.
+    out_wcs, out_wcs_header = _make_sky_wcs(source_ra, source_dec, cutout_pixscale, cutout_size)
+    pixscale_ratio = cutout_pixscale / NIRCAM_LW_PIXSCALE
 
-    out_wcs = WCS(naxis=2)
-    # CRPIX is 1-indexed; (N_out/2 + 1) places the CRVAL at the 0-indexed centre
-    out_wcs.wcs.crpix = [N_out / 2.0 + 1.0, N_out / 2.0 + 1.0]
-    out_wcs.wcs.crval = [source_ra, source_dec]
-    # Negative CDELT[0]: RA decreases as X increases → +X is west (standard)
-    out_wcs.wcs.cdelt = [-pixscale_out_deg, pixscale_out_deg]
-    out_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
-    out_wcs.wcs.set()
-    out_wcs_header = out_wcs.to_header()
-
-    # --- Per-frame accumulators -----------------------------------------------
-    cutout_list   = []   # (sci, line, wht, dq) tuples, shape (N, N) each
+    # Per-frame accumulators
+    cutout_list   = []
     xs_list       = []
     ys_list       = []
     theta_list    = []
@@ -1792,242 +2401,45 @@ def extract_2d_emline_worker(
     effexptm_list = []
     gs_v3pa_list  = []
 
-    # Drizzle objects keyed by module+pupil (e.g. 'AR', 'BC')
-    drz_sci:  dict[str, Drizzle] = {}
-    drz_line: dict[str, Drizzle] = {}
-    drz_psf:  dict[str, Drizzle] = {}
+    frames_sci:  dict[str, list] = {}
+    frames_line: dict[str, list] = {}
+    frames_wht:  dict[str, list] = {}
+    drz_psf:     dict[str, Drizzle] = {}
+    psf_meta:    dict[str, tuple]   = {}
 
-    # PSF metadata per module-pupil: (stpsf_version, oversample_used)
-    psf_meta: dict[str, tuple[str, int]] = {}
-
-    # --- Loop over frames ------------------------------------------------------
     for j, POM_fn in enumerate(POM_path_per_source):
         grism_fn = all_v1p5_list[grism_idx_per_source[j]]
-        POM_cat  = ascii.read(POM_fn)
-
-        image      = fits.getdata(grism_fn, "sci")
-        try:
-            emline = fits.getdata(grism_fn, "emline")
-        except KeyError:
-            emline = image
-        data_quality = fits.getdata(grism_fn, "dq")
-        primary_hd   = fits.getheader(grism_fn)
-        sci_hd       = fits.getheader(grism_fn, "sci")
-
-        _filter = primary_hd["FILTER"]
-        module  = primary_hd["MODULE"]
-        pupil   = primary_hd["PUPIL"][-1]
-
-        if _filter != filter:
+        result = _process_emline_frame(
+            grism_fn, POM_fn, source_id, wave_line_obs,
+            grism_conf, filter, out_wcs, cutout_size,
+            psf_oversample, drz_psf, psf_meta, pixfrac, pixscale_ratio,
+        )
+        if result is None:
             continue
 
-        # Weight map
-        weight_path = grism_fn.replace("lv1.5.fits", "wht.fits")
-        if os.path.isfile(weight_path):
-            weight = fits.getdata(weight_path)
-        else:
-            weight = fits.getdata(grism_fn, "err")
-            weight[weight == 0] = np.nan
-            weight = weight ** -2
+        cutout_list.append(result['cutout'])
+        xs_list.append(result['xs'])
+        ys_list.append(result['ys'])
+        theta_list.append(result['theta'])
+        module_list.append(result['module'])
+        pupil_list.append(result['pupil'])
+        paths_list.append(result['path'])
+        effexptm_list.append(result['effexptm'])
+        gs_v3pa_list.append(result['gs_v3pa'])
 
-        # Source position from POM catalog
-        item_POM = POM_cat[POM_cat["Index"] == source_id]
-        if len(item_POM) == 0:
-            continue
-        x0 = float(item_POM["pixel_x"][0])
-        y0 = float(item_POM["pixel_y"][0])
-
-        # Spectral trace at this position
-        disp_coeff  = grism_conf.get_disp_coeff(module, pupil)
-        trace_coeff = grism_conf.get_trace_coeff(module, pupil)
-        dxs, dys, wavs = grism_conf_preparation(
-            x0=x0, y0=y0, pupil=pupil,
-            fit_opt_fit=trace_coeff, w_opt=disp_coeff,
-        )
-        # Barycentric correction
-        wavs_bary = (1.0 + sci_hd["velosys"] / 299792458.0) * wavs
-
-        # Check that the emission line falls within this frame's wavelength coverage
-        if wave_line_obs < wavs_bary.min() or wave_line_obs > wavs_bary.max():
-            continue
-
-        # Interpolate trace offset at emission line wavelength
-        interp_dx = interpolate.interp1d(
-            wavs_bary, dxs, kind="linear", bounds_error=False, fill_value=np.nan
-        )
-        interp_dy = interpolate.interp1d(
-            wavs_bary, dys, kind="linear", bounds_error=False, fill_value=np.nan
-        )
-        dx_line = float(interp_dx(wave_line_obs))
-        dy_line = float(interp_dy(wave_line_obs))
-        if np.isnan(dx_line) or np.isnan(dy_line):
-            continue
-
-        xs = x0 + dx_line   # grism X position of emission line
-        ys = y0 + dy_line   # grism Y position of emission line
-
-        # --- Dispersion angle in the sky-aligned output frame -----------------
-        # Evaluate trace at ±dwave around the line to get dX/dλ and dY/dλ.
-        dwave = 0.005  # µm; small enough for a local derivative
-        dx_lo = float(interp_dx(wave_line_obs - dwave))
-        dy_lo = float(interp_dy(wave_line_obs - dwave))
-        dx_hi = float(interp_dx(wave_line_obs + dwave))
-        dy_hi = float(interp_dy(wave_line_obs + dwave))
-
-        wcs_grism = WCS(sci_hd)
-        # Convert the two trace endpoints to RA,DEC using the grism WCS
-        coords_lo = wcs_grism.all_pix2world(
-            [[x0 + dx_lo, y0 + dy_lo]], 0
-        )[0]
-        coords_hi = wcs_grism.all_pix2world(
-            [[x0 + dx_hi, y0 + dy_hi]], 0
-        )[0]
-        # Then to output pixel coordinates
-        ox_lo, oy_lo = out_wcs.all_world2pix([[coords_lo[0], coords_lo[1]]], 0)[0]
-        ox_hi, oy_hi = out_wcs.all_world2pix([[coords_hi[0], coords_hi[1]]], 0)[0]
-
-        dX_out = ox_hi - ox_lo   # output pixels over 2*dwave µm
-        dY_out = oy_hi - oy_lo
-        # theta = angle of the dispersion direction in the output frame
-        theta = float(np.angle((dX_out + 1j * dY_out)))
-
-        # --- Padded native cutout -----------------------------------------------
-        # The output grid is sky-aligned (RA/DEC) while the grism frame is
-        # rotated by the telescope position angle.  At worst case (45°), the
-        # axis-aligned output square's corners reach cutout_size*√2/2 native
-        # pixels from the centre — larger than the unpadded cutout_size/2 radius.
-        # We therefore take a padded native cutout whose half-width equals
-        #   ceil(cutout_size * √2 / 2) + 1
-        # so that the rotated output footprint is always fully contained, at
-        # any position angle.  The output grid (N_out = 2*cutout_size pixels)
-        # is NOT changed; extra native pixels simply drizzle outside the output
-        # extent and are ignored.
-        pad_half = int(np.ceil(cutout_size * np.sqrt(2) / 2)) + 1
-        pad_size = 2 * pad_half + 1   # always odd → symmetric aperture
-
-        ny, nx   = image.shape
-        xs_int   = int(np.round(xs))
-        ys_int   = int(np.round(ys))
-        x_lo_cut = xs_int - pad_half
-        y_lo_cut = ys_int - pad_half
-        x_hi_cut = xs_int + pad_half + 1
-        y_hi_cut = ys_int + pad_half + 1
-
-        if x_lo_cut < 0 or x_hi_cut > nx or y_lo_cut < 0 or y_hi_cut > ny:
-            print(" >> [emline] ID%s %s%s cutout out of bounds at (%.1f,%.1f); skip" %
-                  (source_id, module, pupil, xs, ys))
-            continue
-
-        cutout_sci  = image       [y_lo_cut:y_hi_cut, x_lo_cut:x_hi_cut].copy()
-        cutout_line = emline      [y_lo_cut:y_hi_cut, x_lo_cut:x_hi_cut].copy()
-        cutout_wht  = weight      [y_lo_cut:y_hi_cut, x_lo_cut:x_hi_cut].copy()
-        cutout_dq   = data_quality[y_lo_cut:y_hi_cut, x_lo_cut:x_hi_cut].copy()
-
-        # Clean weight: zero out bad and NaN pixels
-        cutout_wht_drz = np.nan_to_num(cutout_wht, nan=0.0, posinf=0.0, neginf=0.0)
-        cutout_wht_drz[cutout_dq % 2 == 1] = 0.0
-
-        # --- Build pixel map for drizzle (grism → output frame) --------------
-        # For padded cutout pixel (ix, iy) (0-indexed over pad_size):
-        #   undispersed position: (x0 + (ix - pad_half), y0 + (iy - pad_half))
-        #
-        # Using (x0 + offset) rather than (x_lo_cut + ix - dx_line) eliminates
-        # the sub-pixel rounding error in xs_int = round(x0 + dx_line):
-        #   naive: undispersed_x = xs_int - dx_line = x0 + round_err
-        #   fixed: undispersed_x = x0 + (ix - pad_half)  → exact at ix=pad_half
-        # The centre pixel (ix=pad_half) maps to (x0,y0) → output centre exactly.
-        iy_arr, ix_arr = np.mgrid[0:pad_size, 0:pad_size]
-        gx_undis = (x0 + (ix_arr - pad_half)).ravel()
-        gy_undis = (y0 + (iy_arr - pad_half)).ravel()
-
-        sky_coords = wcs_grism.all_pix2world(
-            np.column_stack([gx_undis, gy_undis]), 0
-        )
-        out_pix = out_wcs.all_world2pix(sky_coords, 0)
-
-        pixmap = np.dstack([
-            out_pix[:, 0].reshape(pad_size, pad_size),
-            out_pix[:, 1].reshape(pad_size, pad_size),
-        ])
-
-        # --- Store per-frame data ---------------------------------------------
-        cutout_list.append((cutout_sci, cutout_line, cutout_wht, cutout_dq))
-        xs_list.append(xs)
-        ys_list.append(ys)
-        theta_list.append(theta)
-        module_list.append(module)
-        pupil_list.append(pupil)
-        paths_list.append(grism_fn)
-        effexptm_list.append(float(primary_hd.get("EFFEXPTM", np.nan)))
-        gs_v3pa_list.append(float(primary_hd.get("GS_V3_PA", np.nan)))
-
-        # --- Drizzle this frame into the module-pupil accumulator ------------
-        mp_key   = "%s%s" % (module, pupil)
-        effexptm = max(float(primary_hd.get("EFFEXPTM", 1.0)), 1e-6)
-
-        if mp_key not in drz_sci:
-            drz_sci[mp_key]  = Drizzle(kernel="square", out_shape=(N_out, N_out))
-            drz_line[mp_key] = Drizzle(kernel="square", out_shape=(N_out, N_out))
-            drz_psf[mp_key]  = Drizzle(kernel="square", out_shape=(N_out, N_out))
-
-        drz_sci[mp_key].add_image(
-            cutout_sci.astype(np.float64), exptime=effexptm,
-            pixmap=pixmap, weight_map=cutout_wht_drz.astype(np.float64),
-            pixfrac=1.0, in_units="cps", scale=1.0,
-        )
-        drz_line[mp_key].add_image(
-            cutout_line.astype(np.float64), exptime=effexptm,
-            pixmap=pixmap, weight_map=cutout_wht_drz.astype(np.float64),
-            pixfrac=1.0, in_units="cps", scale=1.0,
-        )
-
-        # --- PSF model for this frame -----------------------------------------
-        # Render the PSF at the source detector position (x0, y0).  We use the
-        # imaging PSF (CLEAR pupil) at the filter wavelength, which is an
-        # excellent approximation for the grism spatial PSF.  The PSF is then
-        # drizzled onto the same output grid using the same geometric mapping as
-        # the science cutout (undispersed pixel → sky → output pixel).
-        psf_frame, psf_over_used, psf_ver = _compute_grism_psf_frame(
-            primary_hd=primary_hd,
-            x0=x0, y0=y0,
-            filter_name=filter,
-            oversample=psf_oversample,
-            fov_pixels=pad_size,   # must match padded native cutout
-        )
-        # Record PSF metadata (first frame per mp_key is representative)
-        if mp_key not in psf_meta:
-            psf_meta[mp_key] = (psf_ver, psf_over_used)
-
-        N_psf_over = psf_frame.shape[0]   # = cutout_size * psf_over_used
-        # Pixel map for oversampled PSF: each PSF pixel (ix_over, iy_over)
-        # occupies detector spatial position (x0 + Δx/over, y0 + Δy/over),
-        # centred so that pixel index (N_psf_over-1)/2 maps to (x0, y0).
-        iy_p, ix_p = np.mgrid[0:N_psf_over, 0:N_psf_over]
-        center_over = (N_psf_over - 1) / 2.0
-        gx_psf = (x0 + (ix_p - center_over) / psf_over_used).ravel()
-        gy_psf = (y0 + (iy_p - center_over) / psf_over_used).ravel()
-
-        sky_psf  = wcs_grism.all_pix2world(np.column_stack([gx_psf, gy_psf]), 0)
-        opix_psf = out_wcs.all_world2pix(sky_psf, 0)
-        pixmap_psf = np.dstack([
-            opix_psf[:, 0].reshape(N_psf_over, N_psf_over),
-            opix_psf[:, 1].reshape(N_psf_over, N_psf_over),
-        ])
-
-        # Uniform weight map for PSF (it is already normalised; we weight by
-        # effexptm so longer exposures dominate the coadded PSF model).
-        psf_wht = np.ones_like(psf_frame, dtype=np.float64)
-        drz_psf[mp_key].add_image(
-            psf_frame.astype(np.float64), exptime=effexptm,
-            pixmap=pixmap_psf, weight_map=psf_wht,
-            pixfrac=1.0, in_units="cps", scale=1.0,
-        )
+        mp_key = result['mp_key']
+        if mp_key not in frames_sci:
+            frames_sci[mp_key]  = []
+            frames_line[mp_key] = []
+            frames_wht[mp_key]  = []
+        frames_sci[mp_key].append(result['frame_sci'])
+        frames_line[mp_key].append(result['frame_line'])
+        frames_wht[mp_key].append(result['frame_wht'])
 
     if len(cutout_list) == 0:
         print(" >> [emline] ID%s: no valid cutouts found" % source_id)
         return
 
-    # --- Save all per-frame cutouts -------------------------------------------
     all_fn = os.path.join(
         extraction_dir,
         "emline_2d_%s_ID%s_%s_all.fits" % (filter, source_id, line_tag),
@@ -2040,8 +2452,7 @@ def extract_2d_emline_worker(
     )
     print(" >> [emline] ID%s saved per-frame: %s" % (source_id, all_fn))
 
-    # --- Save drizzled coadd per module-pupil ---------------------------------
-    for mp_key, drz_s in drz_sci.items():
+    for mp_key in frames_sci:
         module_mp = mp_key[0]
         pupil_mp  = mp_key[1]
 
@@ -2050,100 +2461,286 @@ def extract_2d_emline_worker(
         if not idx_mp:
             continue
 
-        mean_theta   = float(np.nanmean([theta_list[i] for i in idx_mp]))
-        diff_theta   = float(np.nanmax([theta_list[i] for i in idx_mp]) -
-                             np.nanmin([theta_list[i] for i in idx_mp]))
-        mean_effexptm = float(np.nansum([effexptm_list[i] for i in idx_mp]))
-        mean_gs_v3pa  = float(np.nanmean([gs_v3pa_list[i] for i in idx_mp]))
+        mean_theta    = float(np.nanmean([theta_list[i]    for i in idx_mp]))
+        diff_theta    = float(np.nanmax([theta_list[i]     for i in idx_mp]) -
+                              np.nanmin([theta_list[i]     for i in idx_mp]))
+        mean_effexptm = float(np.nansum([effexptm_list[i]  for i in idx_mp]))
+        mean_gs_v3pa  = float(np.nanmean([gs_v3pa_list[i]  for i in idx_mp]))
 
-        coadd_sci  = drz_s.out_img
-        coadd_wht  = drz_s.out_wht
-        coadd_line = drz_line[mp_key].out_img
-
-        hdu = fits.PrimaryHDU()
-        hdu.header["ID"]       = (source_id,          "Source ID")
-        hdu.header["RA0"]      = (source_ra,          "Source RA (deg)")
-        hdu.header["DEC0"]     = (source_dec,          "Source DEC (deg)")
-        hdu.header["FILTER"]   = (filter,              "Filter name")
-        hdu.header["MODULE"]   = (module_mp,           "Detector module (A or B)")
-        hdu.header["PUPIL"]    = (pupil_mp,            "Pupil (R=GRISMR, C=GRISMC)")
-        hdu.header["LINENAME"] = (name_line,           "Target emission line")
-        hdu.header["LINEWAVE"] = (wave_line_obs,       "Observed wavelength of line (um)")
-        hdu.header["LINESNR"]  = (eml_snr, "Bestfit S/N of the line from all frames")
-        hdu.header["ZSPEC"]    = (z_spec,              "Spectroscopic redshift")
-        hdu.header["N_COADD"] = (len(idx_mp),         "Number of coadded frames")
-        hdu.header["DISPANG"]    = (float(np.rad2deg(mean_theta)), "Mean dispersion angle (deg)")
-        hdu.header["DISPANGW"] = (float(np.rad2deg(diff_theta)), "Dispersion angle variation among frames (deg)")
-        hdu.header["PIXSCL"]   = (pixscale_out,        "Output pixel scale (arcsec/pix)")
-        hdu.header["EFFEXPTM"] = (mean_effexptm,       "Total effective exposure time (s)")
-        hdu.header["GS_V3_PA"] = (mean_gs_v3pa,        "Mean V3 position angle (deg)")
-        hdu.header["AUTHOR"]   = ("Jiachuan Xu",       "Author")
-        hdu.header["TIME"]     = (
-            time.strftime("%Y/%m/%d %H:%M:%S", time.localtime()), "Creation time"
-        )
-        # Embed output WCS so the FITS file is self-describing
-        for key, val in out_wcs_header.items():
-            hdu.header[key] = val
-
-        hdu_sci  = fits.ImageHDU(coadd_sci.astype(np.float32),  name="SPEC2D")
-        hdu_wht  = fits.ImageHDU(coadd_wht.astype(np.float32),  name="WHT2D")
-        hdu_line = fits.ImageHDU(coadd_line.astype(np.float32), name="LINE2D")
-        # Coverage map
-        hdu_cov  = fits.ImageHDU(
-            np.int8(coadd_wht > 0), name="COV2D"
+        coadd_sci, coadd_line, coadd_wht, coadd_cov = _sigma_clip_weighted_coadd(
+            frames_sci[mp_key], frames_line[mp_key], frames_wht[mp_key],
         )
 
-        hdu_sci.header["BUNIT"]  = ("DN/s", "Brightness unit (no sensitivity correction)")
-        hdu_line.header["BUNIT"] = ("DN/s", "Brightness unit (continuum-subtracted)")
-        hdu_sci.header["COMMENT"]  = "+X = west (+RA), +Y = north (+DEC)"
-        hdu_sci.header["PIXSCL"]   = (pixscale_out, "Pixel scale (arcsec/pix)")
-        hdu_sci.header["DISPANG"]  = (float(np.rad2deg(mean_theta)),
-                                      "Mean dispersion angle in output frame (deg)")
-        hdu_sci.header["DISPANGW"] = (float(np.rad2deg(diff_theta)),
-                                      "Dispersion angle variation among frames (deg)")
-
-        # --- PSF2D extension --------------------------------------------------
-        # Drizzle accumulates PSF values in the same units as a normalised
-        # flux-per-pixel image.  Re-normalise to sum=1 so the PSF is a proper
-        # probability distribution regardless of the number of coadded frames.
         coadd_psf_raw = drz_psf[mp_key].out_img
-        psf_total = coadd_psf_raw.sum()
-        coadd_psf = coadd_psf_raw / psf_total if psf_total > 0 else coadd_psf_raw
+        psf_total     = coadd_psf_raw.sum()
+        coadd_psf     = coadd_psf_raw / psf_total if psf_total > 0 else coadd_psf_raw
 
-        _psf_ver, _psf_over = psf_meta.get(mp_key, ("unknown", psf_oversample))
-        hdu_psf = fits.ImageHDU(coadd_psf.astype(np.float32), name="PSF2D")
-        hdu_psf.header["BUNIT"]    = ("", "Normalised PSF (sums to 1)")
-        hdu_psf.header["COMMENT"]  = "+X = west (+RA), +Y = north (+DEC)"
-        hdu_psf.header["PIXSCL"]   = (pixscale_out,
-                                      "Output pixel scale (arcsec/pix)")
-        hdu_psf.header["PSFMODEL"] = ("stpsf" if "gaussian" not in _psf_ver else "gaussian",
-                                      "PSF model used")
-        hdu_psf.header["STPSFVER"] = (_psf_ver,
-                                      "stpsf version (or 'gaussian_fallback')")
-        hdu_psf.header["PSFOVER"]  = (_psf_over,
-                                      "PSF super-sampling factor (native pix)")
-        hdu_psf.header["PSFFILT"]  = (filter,
-                                      "Filter used for PSF calculation")
-        hdu_psf.header["PSFDET"]   = (
-            "NRC%s5" % module_mp,
-            "Detector name passed to stpsf",
+        hdul_out = _build_emline_coadd_hdul(
+            source_id=source_id, source_ra=source_ra, source_dec=source_dec,
+            filter_name=filter, module_mp=module_mp, pupil_mp=pupil_mp,
+            name_line=name_line, wave_line_obs=wave_line_obs,
+            eml_snr=eml_snr, z_grism=z_grism,
+            pixscale_out=cutout_pixscale,
+            coadd_sci=coadd_sci, coadd_line=coadd_line,
+            coadd_wht=coadd_wht, coadd_cov=coadd_cov,
+            coadd_psf=coadd_psf,
+            n_coadd=len(idx_mp),
+            mean_theta=mean_theta, diff_theta=diff_theta,
+            mean_effexptm=mean_effexptm,
+            mean_gs_v3pa=mean_gs_v3pa,
+            frame_pa=0.0,
+            out_wcs_header=out_wcs_header,
+            psf_meta_mp=psf_meta.get(mp_key, ("unknown", psf_oversample)),
         )
-        hdu_psf.header["N_COADD"] = (len(idx_mp),
-                                      "Number of PSF frames coadded")
-        hdu_psf.header["DISPANG"]  = (float(np.rad2deg(mean_theta)),
-                                      "Mean dispersion angle in output frame (deg)")
-        # Embed output WCS in PSF extension too so it's sky-aware
-        for key, val in out_wcs_header.items():
-            hdu_psf.header[key] = val
-
-        hdul_out = fits.HDUList([hdu, hdu_sci, hdu_wht, hdu_cov, hdu_line, hdu_psf])
         coadd_fn = os.path.join(
             extraction_dir,
-            "emline_2d_%s_ID%s_%s_%scoadd.fits" % (filter, source_id, line_tag, mp_key),
+            "emline_2d_%s_ID%s_%s_%scoadd_drz.fits" % (filter, source_id, line_tag, mp_key),
         )
         hdul_out.writeto(coadd_fn, overwrite=True)
         print(" >> [emline] ID%s %s coadd → %s" % (source_id, mp_key, coadd_fn))
 
+
+def extract_2d_emline_worker_simple(
+    source_item: "Table.Row",
+    grism_conf: "GrismConf",
+    filter: str,
+    extraction_dir: str,
+    cutout_size: int = 51,
+    psf_oversample: int = 4,
+) -> None:
+    """
+    Extract simple-coadded 2-D emission-line cutouts for a single source.
+
+    This function directly take cutouts from the coadded 2D spectra in
+    :func:`extract_2d_spec_worker` method, without performing drizzle re-sampling,
+    and assuming a unified charility of the coadded 2D spectra of +1. Therefore, 
+    when measuring kinematic lensing, the galaxy model will be rotated into this 
+    spectra frame to fit the spectrum data. This means when running with cutouts
+    produced by this function, KL always assume the dispersion angle is almost 0 
+    (disperse along +X direction) and the spectra are right-handed. 
+    For each source, this function will:
+
+    1. Find out the relavant coadded 2D spectra from `extraction_dir` by matching
+       the filename convention ``spec_2d_{FILTER}_ID{OBJID}_{MODULE}{PUPIL}coadd.fits`` 
+    2. Given the input ``source_item``, identify the target emission line and its 
+       observed wavelength, and check if the line falls within the wavelength range
+       of the coadded 2D spectra. If so, take a ``cutout_size × cutout_size`` cutout
+       from both the continuum-included (SCI) and continuum-subtracted (LINE) extensions
+       of the coadded 2D spectra, centred at the predicted pixel position of the target 
+       emission line.
+       Note that the cutouts are taken in the DETECTOR frame, NOT equatorial coord frame. 
+       Therefore the +X axis has a non-trivial position angle in the sky.
+    3. Computes the local dispersion angle θ = angle(dX/dλ + j·dY/dλ) in the DETECTOR 
+       frame (``DISPANG``), and its standard deviation. Also compute the position angle 
+       (``FRAME_PA``) of the +X axis in EQUATORIAL frame (i.e. north up, east left).
+    4. Renders a super-sampled PSF model for each frame via
+       :func:`_compute_grism_psf_frame` (using ``stpsf`` with in-flight OPD
+       when available, falling back to a Gaussian approximation) and combines
+       it into a super-sampled output grid.  The coadded PSF model is saved as the
+       ``PSF2D`` extension in the per-module-pupil coadd FITS file.
+
+    Results are saved as:
+
+    * ``emline_2d_{filter}_ID{id}_{line}_{MP}coadd_simple.fits`` – simple coadd
+      per module-pupil (extensions: SPEC2D, WHT2D, COV2D, LINE2D, PSF2D).
+
+    Parameters
+    ----------
+    source_item:
+        Single row from the source catalog; must contain ``ID``, ``RA``, ``DEC``,
+        ``z_grism``, ``fit_line_SN``, and ``name_line_exp`` columns.
+    grism_conf : GrismConf
+        Grism configuration object containing dispersion calibration, used to
+        compute the predicted emission-line position in each coadded 2D spectrum.
+    filter:
+        Grism filter name (e.g. ``'F356W'``).
+    extraction_dir:
+        Output directory for the simple-coadd FITS files.
+    cutout_size:
+        Side length of the output cutout in native detector pixels (must be odd
+        for a symmetric aperture).  The output is exactly ``cutout_size ×
+        cutout_size`` pixels at the native NIRCam LW pixel scale — no drizzle
+        resampling is performed.
+    psf_oversample:
+        Super-sampling factor for the stpsf PSF model.  The PSF is rendered at
+        ``psf_oversample × native_pixel_scale`` before being drizzled onto the
+        output grid.  Higher values give a more accurate PSF at the cost of
+        longer stpsf computation time.  Ignored in the Gaussian fallback, which
+        always produces a native-scale PSF.
+    """
+    # --- Source info ----------------------------------------------------------
+    source_id  = source_item["ID"]
+    source_ra  = float(source_item["RA"])
+    source_dec = float(source_item["DEC"])
+    eml_snr    = float(source_item["fit_line_SN"])
+
+    # --- Emission line info ---------------------------------------------------
+    try:
+        name_line = str(source_item["name_line_exp"]).strip()
+        z_grism   = float(source_item["z_grism"])
+    except (KeyError, ValueError, TypeError) as exc:
+        print(" >> [emline_simple] source %s: missing z_grism / name_line_exp (%s); skip" %
+              (source_id, exc))
+        return
+
+    if name_line not in EML_LAB:
+        print(" >> [emline_simple] source %s: unknown line '%s'; skip" % (source_id, name_line))
+        return
+
+    wave_line_rest = EML_LAB[name_line]
+    wave_line_obs  = wave_line_rest * (1.0 + z_grism)
+
+    line_tag = "".join(c if c.isalnum() else "_" for c in name_line)
+
+    # --- Loop over module-pupil combinations ---------------------------------
+    for module in ["A", "B"]:
+        for pupil in ["R", "C"]:
+            mp_key   = "%s%s" % (module, pupil)
+            coadd_fn = os.path.join(
+                extraction_dir,
+                "spec_2d_%s_ID%s_%scoadd.fits" % (filter, source_id, mp_key),
+            )
+            if not os.path.isfile(coadd_fn):
+                continue
+
+            with fits.open(coadd_fn) as hdul:
+                sci_hd    = hdul["SPEC2D"].header
+                sci_data  = hdul["SPEC2D"].data.copy()    # (N_spat, N_wave)
+                wht_data  = hdul["WHT2D"].data.copy()
+                cov_data  = hdul["COV2D"].data.copy()
+                line_data = hdul["LINE2D"].data.copy()
+                stats_tb  = Table(hdul["STATS"].data)
+
+            # --- Wavelength calibration and range check -----------------------
+            wave_1  = sci_hd["wave_1"]
+            d_wave  = sci_hd["d_wave"]
+            n_spat, n_wave = sci_data.shape
+
+            if wave_line_obs < wave_1 or wave_line_obs > wave_1 + (n_wave - 1) * d_wave:
+                print(" >> [emline_simple] ID%s %s: line %.4f µm outside coadd range "
+                      "[%.4f, %.4f]; skip" %
+                      (source_id, mp_key, wave_line_obs,
+                       wave_1, wave_1 + (n_wave - 1) * d_wave))
+                continue
+
+            # --- Cutout centre ------------------------------------------------
+            # Emission-line column (wavelength axis, X = NAXIS1 direction).
+            col_line   = (wave_line_obs - wave_1) / d_wave
+            # Source is placed at the spatial centre of the coadded 2D spec.
+            row_center = (n_spat - 1) / 2.0
+
+            half    = (cutout_size - 1) // 2
+            col_int = int(np.round(col_line))
+            row_int = int(np.round(row_center))
+            col_lo  = col_int - half
+            col_hi  = col_int + half + 1   # exclusive → cutout_size columns
+            row_lo  = row_int - half
+            row_hi  = row_int + half + 1   # exclusive → cutout_size rows
+
+            if col_lo < 0 or col_hi > n_wave or row_lo < 0 or row_hi > n_spat:
+                print(" >> [emline_simple] ID%s %s: cutout out of bounds at "
+                      "(col=%.1f, row=%.1f); skip" %
+                      (source_id, mp_key, col_line, row_center))
+                continue
+
+            cutout_sci  = sci_data [row_lo:row_hi, col_lo:col_hi].copy()
+            cutout_wht  = wht_data [row_lo:row_hi, col_lo:col_hi].copy()
+            cutout_cov  = cov_data [row_lo:row_hi, col_lo:col_hi].copy()
+            cutout_line = line_data[row_lo:row_hi, col_lo:col_hi].copy()
+
+            # --- Dispersion angle and position angle --------------------------
+            # In the 2D-spec frame, wavelength is always along +X by construction,
+            # so the dispersion angle is almost zero with no frame-to-frame
+            # variation.
+            dispang_list = []
+            xs_list, ys_list, date_beg_list = [], [], []
+            for iexp in range(len(stats_tb)):
+                x0 = stats_tb["x0"][iexp]
+                y0 = stats_tb["y0"][iexp]
+                xs, ys, theta = get_position_ang_dispang_at_wave(
+                    x0, y0, wave_line_obs, grism_conf, module, pupil)
+                if (xs < VALID_X_LEFT) or (xs > VALID_X_RIGHT) or (ys < VALID_Y_BOTTOM) or (ys > VALID_Y_TOP):
+                    continue
+                dispang_list.append(theta)
+                xs_list.append(xs)
+                ys_list.append(ys)
+                date_beg_list.append(stats_tb["DATE-BEG"][iexp])
+            n_coadd = len(dispang_list)
+            if n_coadd == 0:
+                print(" >> [emline_simple] ID%s %s: no valid emission line cutout" %
+                      (source_id, mp_key))
+                continue
+            theta_det     = float(np.nanmean(dispang_list))
+            theta_det_std = float(np.nanstd(dispang_list))
+            if not np.isfinite(theta_det):
+                print(" >> [emline_simple] ID%s %s: invalid mean dispersion angle" %
+                      (source_id, mp_key))
+                print("    dispersion angles:", dispang_list)
+                exit(1)
+
+            # Position angle of the +X (dispersion direction) axis in equatorial frame 
+            # (north up, east left), derived from GS_V3_PA:
+            mean_gs_v3pa  = float(np.deg2rad(np.nanmean(stats_tb["GS_V3_PA"]%360.0)))
+            mean_effexptm = float(np.nansum(stats_tb["EFFEXPTM"]))
+            if mp_key == "AC":
+                pa_x_eq = (mean_gs_v3pa + np.pi/2.) % (2*np.pi)
+                theta_det = (theta_det - np.pi/2.) % (2*np.pi)
+            elif mp_key == "BR":
+                pa_x_eq = (mean_gs_v3pa + np.pi) % (2*np.pi)
+                theta_det = (theta_det - np.pi) % (2*np.pi)
+            elif mp_key == "BC":
+                pa_x_eq = (mean_gs_v3pa + np.pi/2.) % (2*np.pi)
+                theta_det = (theta_det - np.pi/2.) % (2*np.pi)
+            else:   # "AR"
+                pa_x_eq = mean_gs_v3pa
+
+            # --- PSF model ----------------------------------------------------
+            # Mean PSF from stpsf across frames, at the predicted line position.
+            psf_over_raw_list = []
+            for _xs, _ys, _d in zip(xs_list, ys_list, date_beg_list):
+                psf_hd  = fits.Header()
+                psf_hd["MODULE"]   = module
+                psf_hd["DET_NAME"] = "NRC%s5" % module
+                psf_hd["DATE-BEG"] = _d
+                psf_over_raw, _, _ = _compute_grism_psf_frame(
+                    primary_hd=psf_hd,
+                    xs=_xs,
+                    ys=_ys,
+                    filter_name=filter,
+                    oversample=psf_oversample,
+                    fov_pixels=cutout_size,
+                )
+                psf_over_raw_list.append(psf_over_raw)
+            psf_over_raw = np.array(psf_over_raw_list).mean(axis=0)
+            psf_norm = psf_over_raw / psf_over_raw.sum()
+
+            # --- Build and save output FITS file -------------------------------------
+            hdul_out = _build_emline_coadd_hdul(
+                source_id=source_id, source_ra=source_ra, source_dec=source_dec,
+                filter_name=filter, module_mp=module, pupil_mp=pupil,
+                name_line=name_line, wave_line_obs=wave_line_obs,
+                eml_snr=eml_snr, z_grism=z_grism,
+                pixscale_out=NIRCAM_LW_PIXSCALE,
+                coadd_sci=cutout_sci, coadd_line=cutout_line,
+                coadd_wht=cutout_wht, coadd_cov=cutout_cov,
+                coadd_psf=psf_norm,
+                n_coadd=n_coadd,
+                mean_theta=theta_det,
+                diff_theta=theta_det_std,
+                mean_effexptm=mean_effexptm,
+                mean_gs_v3pa=mean_gs_v3pa,
+                frame_pa=pa_x_eq,
+                wave_1=wave_1 + col_lo * d_wave,
+                d_wave=d_wave,
+                cutout_size=cutout_size,
+                chiral=1,
+            )
+            out_fn = os.path.join(
+                extraction_dir,
+                "emline_2d_%s_ID%s_%s_%scoadd_simple.fits" % (
+                    filter, source_id, line_tag, mp_key),
+            )
+            hdul_out.writeto(out_fn, overwrite=True)
+            print(" >> [emline_simple] ID%s %s coadd → %s" % (source_id, mp_key, out_fn))
+
     return
-
-
