@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nircam_wfss"
+version = "0.1.0"
+description = "NIRCam Wide-Field Slitless Spectroscopy grism extraction pipeline (with variations for kinematic lensing measurement)"
+requires-python = ">=3.9"
+
+[tool.setuptools]
+packages = ["nircam_wfss"]
+
+[tool.setuptools.package-dir]
+"nircam_wfss" = "src"
+
+[project.scripts]
+run-pipeline = "nircam_wfss.run_pipeline:main"

@@ -1,0 +1,4 @@
+data/.DS_Store
+data/jwst_pipeline_config/.DS_Store
+src/__pycache__/
+nircam_wfss.egg-info/

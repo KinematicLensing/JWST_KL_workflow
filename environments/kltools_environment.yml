@@ -363,4 +363,4 @@ dependencies:
       - widgetsnbextension==4.0.13
       - zeus-mcmc==2.5.4
       - zuko==1.4.1
-prefix: /groups/timeifler/jiachuanxu/python_envs/envs/kltools
+#prefix: /groups/timeifler/jiachuanxu/python_envs/envs/kltools
