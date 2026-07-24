@@ -1173,12 +1173,17 @@ def extract_1d_spec_worker(
 
     if filter_ == 'F444W':
         wave_range = np.array([3.8, 5.1]);   mag_keyword = 'F444W_mag'
+        flux_keyword = 'F444W_KRON'
     elif filter_ == 'F322W2':
         wave_range = np.array([2.35, 4.1]);  mag_keyword = 'F356W_mag'
+        flux_keyword = 'F356W_KRON'
     elif filter_ == 'F356W':
         wave_range = np.array([3.05, 4.0]);  mag_keyword = 'F356W_mag'
+        flux_keyword = 'F356W_KRON'
     else:
         raise ValueError('filter %s not recognized' % filter_)
+
+    if 
 
     source_mag = spec2d_fits[0].header[mag_keyword]
     try:
