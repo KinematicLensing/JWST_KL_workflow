@@ -1,7 +1,7 @@
-# Measuring Kinematic Lensing with JWST FRESCO+JADES Data
+# Measuring Kinematic Lensing with JWST SAPPHIRES Data
 
-This repository archives the workflow of a preliminary exploration of kinematic lensing (KL) measurement using JWST NIRCam grism data, FRESCO, and JWST imaging data (JADES). 
-To run the KL analysis, you need to install the kl-tools and download the FRESCO+JADES rate data. 
+This repository archives the workflow of a priliminary exploration of kinematic lensing (KL) measurement using JWST NIRCam grism and image data from the SAPPHIRES EDR. 
+To run the KL analysis, you need to install the kl-tools and download the SAPPHIRES data. 
 
 ## 1. Python Environment
 This KL analysis is build on top of two kinds of python environment: `jwst` for JWST data reduction, and `kltools` for KL fitting. 
