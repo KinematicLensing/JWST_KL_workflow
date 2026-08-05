@@ -217,7 +217,6 @@ def main(argv: list[str] | None = None) -> int:
     bkg_args = [(f, cfg.cali_support_dir, cfg.plot_dir) for f in list_v1p5_this_band]
     with Pool(min(cfg.n_procs, len(list_v1p5_this_band))) as pool:
         pool.map(_bkg_worker, bkg_args)
-
     # =========================================================================
     # STAGE 2d – Hot-pixel rejection (v1.5 inplace)
     # =========================================================================
@@ -263,6 +262,7 @@ def main(argv: list[str] | None = None) -> int:
         ]
         with Pool(min(cfg.n_procs, len(cfg.list_rate_sw))) as pool:
             pool.map(_daofind_worker, daofind_args)
+        print("finished Pool -- beginning calibrate astrometry")
         tb_sw_astrometry = calibrate_astrometry(
             cfg.list_rate_sw,
             cfg.direct_image_dir,
@@ -328,6 +328,7 @@ def main(argv: list[str] | None = None) -> int:
     # =========================================================================
     # STAGE 7 – Extract 1D spectra for each source
     # =========================================================================
+    print("\n========== STAGE 7: Extract 1D Grism Spectra ==========")
     spec1d_args = []
     for i in range(len(tb_source)):
         spec2d_path = os.path.join(

@@ -108,6 +108,7 @@ def my_daofind_sw_fits(
     fwhm: float = 5.0,
     threshold: float = 7.0,
     use_default_wcs: bool = True,
+    overwrite: bool = False,
 ) -> Table | None:
     """
     Run DAOStarFinder on a calibrated NIRCam SW image and return a source
@@ -153,7 +154,7 @@ def my_daofind_sw_fits(
 
     # --- Choose WCS source ---
     if use_default_wcs:
-        with fits.open(tmp_rate_sw) as rate_sw_fits:
+        with fits.open(tmp_rate_sw, memmap=False) as rate_sw_fits:
             rate_sw_hd = rate_sw_fits[0].header
             siaf_file = crds.getreferences(
                 rate_sw_hd, reftypes=["distortion"], ignore_cache=False
@@ -166,11 +167,11 @@ def my_daofind_sw_fits(
             tmp_wcs = rate_sw_IM_wcs.get_fits_wcs()
             rate_sw_IM_wcs.close()
     else:
-        with fits.open(cal_file) as hdul:
+        with fits.open(cal_file, memmap=False) as hdul:
             tmp_wcs = wcs.WCS(hdul[1].header)
 
     # --- Build detection image ---
-    with fits.open(cal_file) as hdul:
+    with fits.open(cal_file, memmap=False) as hdul:
         detect_hd = hdul[0].header
         tmp_detect_img = np.nan_to_num(hdul["SCI"].data)
 
@@ -185,6 +186,13 @@ def my_daofind_sw_fits(
     tmp_detect_img = (tmp_detect_img - bkg.background) / tmp_std
 
     # --- DAOStarFinder ---
+    daofile = os.path.join(astrometry_dir, os.path.basename(tmp_rate_sw).replace("_rate.fits", "_daofind.dat"))
+    if os.path.exists(daofile) and not overwrite:
+        print(
+            f"DAOFind already complete: %s" % daofile
+        )
+        return
+
     print("Running DAOFind on %s" % os.path.basename(cal_file))
     daofind = DAOStarFinder(fwhm=fwhm, threshold=threshold)
     tb_daofind = daofind(tmp_detect_img)
@@ -315,6 +323,7 @@ def calibrate_astrometry(
         
         ## Cross match DAOFind Catalog with Gaia Catalog
         idx_daofind, d2d, _ = tmp_coord_ref.match_to_catalog_sky(tmp_coord_daofind)
+        print(d2d)
         idx_ref = np.where(d2d < 0.25 * u.arcsec)[0]
         idx_daofind = idx_daofind[idx_ref]
         if len(idx_daofind) == 0:

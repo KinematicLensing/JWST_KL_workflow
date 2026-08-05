@@ -296,8 +296,8 @@ def build_POM_applied_catalog(
         if 'F444W_mag' in tb_sub.colnames: tmp_mag_auto = tb_sub['F444W_mag'].data
         elif 'F200W_mag' in tb_sub.colnames: tmp_mag_auto = tb_sub['F200W_mag'].data
         tb_pom_applied = Table(data = [tb_sub['ID'].data, tb_sub["RA"], tb_sub["DEC"], 
-                                    pixelx, pixely, tmp_mag_auto,],
-                    names = ['Index', 'ra', 'dec', 'pixel_x', 'pixel_y', 'MAG_AUTO'])
+                                    pixelx, pixely,], #tmp_mag_auto,],
+                    names = ['Index', 'ra', 'dec', 'pixel_x', 'pixel_y']) #, 'MAG_AUTO'])
         # whether the source falls on POM or not
         # If POM_threshold is set to zero, we only care if the source is picked by the POM, we don't care how much spectrum it yield
         # If POM_threshold is set to a value between 0 and 1, we require the spectrum to be at least POM_threshold complete
@@ -317,7 +317,7 @@ def build_POM_applied_catalog(
         tb_pom_applied['dec'].info.format = '.6f'
         tb_pom_applied['pixel_x'].info.format = '.3f'
         tb_pom_applied['pixel_y'].info.format = '.3f'
-        tb_pom_applied['MAG_AUTO'].info.format = '.3f'
+        # tb_pom_applied['MAG_AUTO'].info.format = '.3f'
         try:
             tb_pom_applied['MAGERR_AUTO'].info.format = '.3f'
             tb_pom_applied['A_IMAGE'].info.format = '.3f'

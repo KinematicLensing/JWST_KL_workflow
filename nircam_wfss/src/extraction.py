@@ -274,7 +274,7 @@ def extract_2d_spec(
     hdu = fits.PrimaryHDU()
     hdu.header["X0"]     = (np.float32(x0), "Reference position X in direct image")
     hdu.header["Y0"]     = (np.float32(y0), "Reference position Y in direct image")
-    hdu.header["AUTHOR"] = ("Jiachuan Xu", "Author of this file")
+    hdu.header["AUTHOR"] = ("Emily Macbeth", "Author of this file")
     hdu.header["CHIRAL"] = (chirality, "Trace chirality: +1 or -1")
     hdu.header["TIME"]   = (
         time.strftime("%Y/%m/%d %H:%M:%S", time.localtime()), "Time of Creation"
@@ -428,7 +428,7 @@ def store_all_2d_spec(
     ind_hdul[0].header["N_COADD"] = (len(pupils), "Total coadded frames")
     ind_hdul[0].header["N_R"] = (sum(p == "R" for p in pupils), "Frames from GRISMR")
     ind_hdul[0].header["N_C"] = (sum(p == "C" for p in pupils), "Frames from GRISMC")
-    ind_hdul[0].header["AUTHOR"] = ("Jiachuan Xu", "Author")
+    ind_hdul[0].header["AUTHOR"] = ("Emily Macbeth", "Author")
     ind_hdul[0].header["TIME"]   = (
         time.strftime("%Y/%m/%d %H:%M:%S", time.localtime()), "Creation time"
     )
@@ -840,7 +840,7 @@ def extract_2d_spec_worker(
                 hdu.header['DEC0']   = (source_coord.dec.value, 'Reference position Dec in direct image')
                 hdu.header['N_coadd'] = (N_exp, 'Number of coadded frames')
                 hdu.header['EFFEXPTM'] = (np.nansum(tmp_tb_cov['EFFEXPTM']), 'Maximum exposure time [s]')
-                hdu.header['author'] = ("Jiachuan Xu", 'Author of this file')
+                hdu.header['author'] = ("Emily Macbeth", 'Author of this file')
                 hdu.header['time'] = (time.strftime("%Y/%m/%d %H:%M:%S",  time.localtime()), 'Time of Creation')
                 hdu.header['filter'] = (filter, 'Filter name')
                 hdu.header['module'] = (module, 'Detector module (A or B)')
@@ -1021,7 +1021,7 @@ def _get_mosaic_cutout(
     from astropy.wcs import WCS
     from astropy.nddata import Cutout2D
 
-    fname = _os.path.join(mosaic_dir, mosaic_filename_fmt % (field, band.lower()))
+    fname = _os.path.join(mosaic_dir, mosaic_filename_fmt % band)
     try:
         with fits.open(fname, memmap=True) as hdul:
             for hdu in hdul:
@@ -1167,6 +1167,7 @@ def extract_1d_spec_worker(
     spec2d_fits = fits.open(spec2d_path)
 
     # --- Source metadata ---
+    header = spec2d_fits[0].header
     source_id = spec2d_fits[0].header['ID']
     filter_   = spec2d_fits[0].header['FILTER']
     obs_pa    = spec2d_fits[0].header['GS_V3_PA']  # V3 PA needed for morphology orientation
@@ -1183,9 +1184,13 @@ def extract_1d_spec_worker(
     else:
         raise ValueError('filter %s not recognized' % filter_)
 
-    if 
+    # include if statement for when magnitude is not included in the phot catalog
+    if mag_keyword in header:
+        source_mag = spec2d_fits[0].header[mag_keyword]
+    elif flux_keyword in header:
+        flux = spec2d_fits[0].header[flux_keyword]
+        source_mag = -2.5*np.log10(flux) + 31.4
 
-    source_mag = spec2d_fits[0].header[mag_keyword]
     try:
         source_mag = float(source_mag)
     except (TypeError, ValueError):
@@ -1660,7 +1665,7 @@ def store_all_2d_emline(
     hdul[0].header["LINENAME"] = (name_line,             "Target emission line")
     hdul[0].header["LINEWAVE"] = (wave_line,             "Observed wavelength of line (um)")
     hdul[0].header["N_COADD"] = (len(cutout_list),       "Total number of frames")
-    hdul[0].header["AUTHOR"]   = ("Jiachuan Xu",         "Author")
+    hdul[0].header["AUTHOR"]   = ("Emily Macbeth",         "Author")
     hdul[0].header["TIME"]     = (
         time.strftime("%Y/%m/%d %H:%M:%S", time.localtime()), "Creation time"
     )
@@ -2215,7 +2220,7 @@ def _build_emline_coadd_hdul(
         hdu.header["WAVE_1"] = (wave_1, "Wavelength of first cutout pixel (um)")
     if d_wave is not None:
         hdu.header["D_WAVE"] = (d_wave, "Wavelength step (um/pix)")
-    hdu.header["AUTHOR"]   = ("Jiachuan Xu", "Author")
+    hdu.header["AUTHOR"]   = ("Emily Macbeth", "Author")
     hdu.header["TIME"]     = (
         time.strftime("%Y/%m/%d %H:%M:%S", time.localtime()), "Creation time"
     )
