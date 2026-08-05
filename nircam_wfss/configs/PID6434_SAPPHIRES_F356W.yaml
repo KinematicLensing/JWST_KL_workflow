@@ -1,0 +1,103 @@
+# =============================================================================
+# NIRCam WFSS Pipeline Configuration
+# PID 6434 – SAPPHIRES, F444W grism
+# =============================================================================
+# Usage:
+#   python run_pipeline.py configs/PID6434_SAPPHIRES_F444W.yaml
+#
+# All paths may be absolute or relative to the working directory.
+# Keys not recognised by PipelineConfig are silently ignored.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Programme metadata
+# ---------------------------------------------------------------------------
+pid: 6434
+
+# ---------------------------------------------------------------------------
+# Source catalogue
+# ---------------------------------------------------------------------------
+source_catalog_path: /xdisk/timeifler/macbeth/sapphires_data/v3_sapphires_edr_phot_cat.fits
+
+# ---------------------------------------------------------------------------
+# Data directories and file patterns
+# ---------------------------------------------------------------------------
+data_dir:         /xdisk/timeifler/macbeth/sapphires_data
+
+# NIRCam SW direct-imaging rate files
+# Note that direct image is only used for astrometry calibration. If the astrometry table
+# has already been generated and saved to disk, you can skip direct image reduction and 
+# astrometry stars extraction
+direct_image_dir:            /xdisk/timeifler/macbeth/sapphires_data/direct_imaging
+direct_image_filename_fmt:   "jw06434*_nrc[a-b][1-4]_rate.fits"
+
+# NIRCam LW grism rate files (stage-1 output)
+grism_data_dir:    /xdisk/timeifler/macbeth/sapphires_data/grism_demo
+grism_filename_fmt: "jw06434*nrc[ab]long_rate.fits"
+
+# ---------------------------------------------------------------------------
+# Imaging mosaic (for direct-image cutouts in 1D extraction diagnostic plots)
+# ---------------------------------------------------------------------------
+image_mosaic_dir:          /xdisk/timeifler/macbeth/sapphires_data/sapphires_edr_nircam_sci
+image_mosaic_filename_fmt: "4750_%s_v05_sci.fits"
+image_mosaic_rgb_bands:    [F115W, F200W, F444W]
+image_mosaic_field:        sapphires
+
+# ---------------------------------------------------------------------------
+# Intermediate calibration and output directories
+# ---------------------------------------------------------------------------
+# Where lv1.5 grism files, astrometry catalogs, plots, and POM catalogs live
+calibrated_dir: /xdisk/timeifler/macbeth/sapphires_data/grism_cal
+
+# F. Sun's supportive calibration data (dispersion solution, sensitivity,
+# super-sky backgrounds, speccov files for partial POM coverage)
+cali_support_dir: /groups/timeifler/macbeth/nircam_wfss/data/FSun_cal
+
+# Default POM transformation files
+default_POM_trans_dir: /groups/timeifler/macbeth/nircam_wfss/data/GRISM_NIRCAM
+
+# Astrometry calibration table – if the file exists it is loaded directly;
+# if not, DAOFIND is run on the SW images and the table is generated.
+astrometry_cal_table: /home/u26/macbeth/KL/JWST_KL_workflow/nircam_wfss/data/FSun_cal/PID_6434_SW_wavecal_edr.dat
+
+# External astrometry reference catalogue (e.g. calibrated to Gaia via HST)
+astrometry_ref_table: /home/u26/macbeth/KL/JWST_KL_workflow/nircam_wfss/data/FSun_cal/goods_charge_F160W_daofind.cat
+
+# Output directory for extracted 2-D / 1-D spectra and emission-line cutouts
+extract_dir: /xdisk/timeifler/macbeth/sapphires_data/extract
+
+# ---------------------------------------------------------------------------
+# Reduction parameters
+# ---------------------------------------------------------------------------
+grism_filter:  F356W     # NIRCam filter for grism observations
+n_procs:       20        # number of parallel worker processes
+
+# Cross-dispersion aperture half-width used during 2D spectral extraction (pix)
+aperture_pix:  15.0
+
+# Hot-pixel detection sigma threshold (higher = more conservative)
+sigma_hot:     20.0
+
+# PSF super-sampling factor for stpsf emission-line PSF models
+psf_oversample: 4
+
+# Overwrite existing lv1.5 / background files (False = skip if present)
+overwrite: false
+overwrite_spec2d: true
+
+# Brightness unit for the stacked extracted 2D spectra. Options: "DN/s" or "mJy"
+bunit_spec2d: "DN/s"
+
+# Coadd method for combining multiple grism exposures in the emission line cutout
+# Options are "drizzle" or "simple"
+# "drizzle": re-sample each exposure into a Equatorial coordinate grid.
+# "simple": no re-sample, keep the original pixel size, and stack in detector frame,
+#           no RA-DEC alignment. PA angle of the +X axis is provided.
+coadd_method: "simple"
+cutout_size_simple: 31
+# Drizzle output pixel scale (arcsec/pix) — controls output grid resolution
+finalscale_drizzle: 0.035
+# Drizzle drop-size fraction (pixfrac argument to Drizzle.add_image)
+pixfrac_drizzle: 0.8
+# Drizzle cutout size in pixels
+cutout_size_drizzle: 61
