@@ -85,6 +85,8 @@ The adjusted catalogs are saved to `/xdisk/timeifler/jiachuanxu/jwst/fengwu_cata
 
 > Note: The catalog adjustment notebook above also contains merging system removal step. Although the merging detection step is technically in [Sect. 3.2](#32-imaging-target-selection), those two steps may be merged into one step in future. The workflow, including how to detect merging system, is still not finalized. 
 
+> Note: Since stellar mass SED fitting needs total flux, we also include the total flux derived from curve-of-growth catalog of JADES DR5 in this step. 
+
 
 ### 3.2 Imaging Target Selection
 
@@ -114,6 +116,8 @@ A rough number of decrease as we apply some of the criteria
 
 So all galaxies pass the WL size criteria, and roughly 80 percent of galaxies survived after blending cut. Note that we will re-iterate on the blending detection in future when we have better blending detection algo. 
 
+> Note: we also build merged catalog for the GOODS-N field in this step, since both FRESCO and CONGRESS covers GOODS-N
+
 
 ### 3.3 Grism Reduction
 
@@ -131,13 +135,42 @@ This will produce the following data products in the `extract_dir` directory:
 - `spec_1d_${BAND}_ID${OBJID}_allcoadd.fits`: stacked 1D spectra
 -  `emline_2d_${BAND}_ID${OBJID}_${EMLISSION_LINE}_${MODE}${PUPIL}coadd_${COADD_METHOD}.fits`: stacked 2D cutout of emission line `EMLISSION_LINE`, grouped by mode and pupil. There are two coadd methods, drizzle (`COADD_METHOD=drz`) or nearest pixel (`COADD_METHOD=simple`). The drizzle method has strong correlated noise, and currently we suggest using the simple method. In future, we may consider include `IMCOM` to do the mosaic. 
 
+### 3.4 Cutout Compilation for KL Pipeline
+
+> pipeline: [Compile_Cutouts_For_KL.ipynb](./notebook/Compile_Cutouts_For_KL.ipynb)
+
+The steps above are processing JWST grism image based on grism **datasets** (meaning FRESCO, CONGRESS, etc). Now, we will build a **galaxy-oriented** cutout compilation such that each FITS file contains the image, noise, PSF, and mask of both the F444W broadband image and emission line grism. Note that some galaxies may have more than one emission line being measured from more than one datasets (when they overlap), or each emission line measured by more than one dispersion angle. We will collect all the different emission lines and dispersion angles for each galaxy. 
+
+#### Input
+The [Compile_Cutouts_For_KL.ipynb](./notebook/Compile_Cutouts_For_KL.ipynb) notebook will read 
+- the 2D grism data reduced in [Sect. 3.3](#33-grism-reduction)
+- the cleaned source catalog from [Sect. 3.2](#32-image-target-selection)
+- the photometric image mosaic where the image cutout is taken
+
+#### Output
+Cutouts FITS files, each includes
+- Primary header of the basic information of the source galaxy (RA, Dec, redshift, photometry, etc.)
+- Broadband image data, noise std, (supersampled) pixelized PSF, and mask
+- Grism data, noise std, (supersampled) pixelized PSF, and mask, **for each emission line covered from any dataset**
+- Headers in each extension, which hold keywords that `kl-tools` pipeline needs to fit KL
+
+
+
 ## 4. Measure Kinematic Lensing with `kltools` Pipeline
 
 ### 4.1 Removing sub-structures in imaging
 
+> pipeline: [kl-tools/scripts/bulge_disk_decomposition.py]
+
 Since JWST is so powerful that it can resolve the sub-structures of galaxies (spiral arms, star formation knots, etc.) with unprecedented resolution, and our KL pipeline assumes a parametric smooth morphology profile, we need to remove the sub-structures in the galaxy image which may potentially bias our KL measurement. To do so, we first run a 2D bulge+disk decomposition on the broadband image of the source galaxies, without turning on cosmic shear. The overall goal is to fit the large-scale smooth profile with a flexible bulge+disk model, and subtract the residual sub-structures. 
 
-### 4.2 Run kinematic lensing pipeline
+### 4.2 Fitting multiband SED and get Tully-Fisher prior
+
+> pipeline: [kl-tools/scripts/stellar_mass_sed_fitting.py]
+
+In this step, we fit the stellar mass using the multiband photometry from JADES DR5 catalog, using package `prospector`. 
+
+### 4.3 Run kinematic lensing pipeline
 
 ## 5. Target Selection
 

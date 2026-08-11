@@ -17,7 +17,7 @@ pid: 3577
 # ---------------------------------------------------------------------------
 # Source catalogue
 # ---------------------------------------------------------------------------
-source_catalog_path: /xdisk/timeifler/jiachuanxu/jwst/fengwu_catalog/v2_gdn_congress_line_list_low-ground-z_Pa_Br_jades_dr5.fits
+source_catalog_path: /xdisk/timeifler/jiachuanxu/jwst/fengwu_catalog/v2_gdn_congress_line_list_low-ground-z_Pa_Br_jades_dr5_blended.fits
 
 # ---------------------------------------------------------------------------
 # Data directories and file patterns
