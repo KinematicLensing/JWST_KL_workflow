@@ -2461,11 +2461,22 @@ def extract_2d_emline_worker_drizzle(
         if not idx_mp:
             continue
 
-        mean_theta    = float(np.nanmean([theta_list[i]    for i in idx_mp]))
-        diff_theta    = float(np.nanmax([theta_list[i]     for i in idx_mp]) -
-                              np.nanmin([theta_list[i]     for i in idx_mp]))
+        _theta_list_mp = np.array([theta_list[i] for i in idx_mp if not np.isnan(theta_list[i])])
+        _gs_v3pa_list_mp = np.array([gs_v3pa_list[i] for i in idx_mp if not np.isnan(gs_v3pa_list[i])])
+        mean_theta = float(np.atan2(
+            np.mean(np.sin(_theta_list_mp)),
+            np.mean(np.cos(_theta_list_mp)),
+        ))
+        diff_theta = float(np.std(_theta_list_mp - mean_theta))
+        mean_gs_v3pa = float(np.atan2(
+            np.mean(np.sin(_gs_v3pa_list_mp)),
+            np.mean(np.cos(_gs_v3pa_list_mp)),
+        ))
+        # mean_theta    = float(np.nanmean([theta_list[i]    for i in idx_mp]))
+        # diff_theta    = float(np.nanmax([theta_list[i]     for i in idx_mp]) -
+        #                       np.nanmin([theta_list[i]     for i in idx_mp]))
         mean_effexptm = float(np.nansum([effexptm_list[i]  for i in idx_mp]))
-        mean_gs_v3pa  = float(np.nanmean([gs_v3pa_list[i]  for i in idx_mp]))
+        # mean_gs_v3pa  = float(np.nanmean([gs_v3pa_list[i]  for i in idx_mp]))
 
         coadd_sci, coadd_line, coadd_wht, coadd_cov = _sigma_clip_weighted_coadd(
             frames_sci[mp_key], frames_line[mp_key], frames_wht[mp_key],
@@ -2670,8 +2681,16 @@ def extract_2d_emline_worker_simple(
                 print(" >> [emline_simple] ID%s %s: no valid emission line cutout" %
                       (source_id, mp_key))
                 continue
-            theta_det     = float(np.nanmean(dispang_list))
-            theta_det_std = float(np.nanstd(dispang_list))
+            dispang_list = np.array(dispang_list)
+            _m = np.isfinite(dispang_list)
+            theta_det = float(np.atan2(
+                np.mean(np.sin(np.array(dispang_list)[_m])),
+                np.mean(np.cos(np.array(dispang_list)[_m])),
+            ))
+            theta_det_diff = dispang_list[_m] - theta_det
+            theta_det_std = float(np.sqrt(np.mean(theta_det_diff**2)))
+            #theta_det     = float(np.nanmean(dispang_list))
+            #theta_det_std = float(np.nanstd(dispang_list))
             if not np.isfinite(theta_det):
                 print(" >> [emline_simple] ID%s %s: invalid mean dispersion angle" %
                       (source_id, mp_key))
@@ -2680,7 +2699,12 @@ def extract_2d_emline_worker_simple(
 
             # Position angle of the +X (dispersion direction) axis in equatorial frame 
             # (north up, east left), derived from GS_V3_PA:
-            mean_gs_v3pa  = float(np.deg2rad(np.nanmean(stats_tb["GS_V3_PA"]%360.0)))
+            _m = np.isfinite(stats_tb["GS_V3_PA"])
+            mean_gs_v3pa = float(np.atan2(
+                np.mean(np.sin(np.deg2rad(stats_tb["GS_V3_PA"][_m]))),
+                np.mean(np.cos(np.deg2rad(stats_tb["GS_V3_PA"][_m]))),
+            ))
+            #mean_gs_v3pa  = float(np.deg2rad(np.nanmean(stats_tb["GS_V3_PA"]%360.0)))
             mean_effexptm = float(np.nansum(stats_tb["EFFEXPTM"]))
             if mp_key == "AC":
                 pa_x_eq = (mean_gs_v3pa + np.pi/2.) % (2*np.pi)
@@ -2697,12 +2721,13 @@ def extract_2d_emline_worker_simple(
             # --- PSF model ----------------------------------------------------
             # Mean PSF from stpsf across frames, at the predicted line position.
             psf_over_raw_list = []
+            psf_mp = None
             for _xs, _ys, _d in zip(xs_list, ys_list, date_beg_list):
                 psf_hd  = fits.Header()
                 psf_hd["MODULE"]   = module
                 psf_hd["DET_NAME"] = "NRC%s5" % module
                 psf_hd["DATE-BEG"] = _d
-                psf_over_raw, _, _ = _compute_grism_psf_frame(
+                psf_over_raw, _oversample_, _psf_version_ = _compute_grism_psf_frame(
                     primary_hd=psf_hd,
                     xs=_xs,
                     ys=_ys,
@@ -2711,6 +2736,8 @@ def extract_2d_emline_worker_simple(
                     fov_pixels=cutout_size,
                 )
                 psf_over_raw_list.append(psf_over_raw)
+                if psf_mp is None:
+                    psf_mp = (_psf_version_, _oversample_)
             psf_over_raw = np.array(psf_over_raw_list).mean(axis=0)
             psf_norm = psf_over_raw / psf_over_raw.sum()
 
@@ -2723,7 +2750,7 @@ def extract_2d_emline_worker_simple(
                 pixscale_out=NIRCAM_LW_PIXSCALE,
                 coadd_sci=cutout_sci, coadd_line=cutout_line,
                 coadd_wht=cutout_wht, coadd_cov=cutout_cov,
-                coadd_psf=psf_norm,
+                coadd_psf=psf_norm, psf_meta_mp=psf_mp,
                 n_coadd=n_coadd,
                 mean_theta=theta_det,
                 diff_theta=theta_det_std,
